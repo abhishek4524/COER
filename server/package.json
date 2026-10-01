@@ -1,0 +1,26 @@
+{
+  "name": "personify-server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node src/workers/personas.js",
+    "test:routes": "node scripts/testRoutes.js",
+    "test:agent": "node scripts/testAgent.js",
+    "demo:start": "node ../demo-site/server.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "bullmq": "^6.3.11",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "ioredis": "^6.0.0",
+    "mongoose": "^9.10.3",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.63.0",
+    "socket.io": "^4.8.4"
+  }
+}

@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+*.env
+
+# Playwright Screenshots & Artifacts
+screenshots/
+scripts/artifacts/
+*.png
+*.webm
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db

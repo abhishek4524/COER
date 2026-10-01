@@ -1,0 +1,14 @@
+{
+  "name": "personify-demo-site",
+  "version": "1.0.0",
+  "description": "Deliberately flawed e-commerce signup/checkout — used as test target for Personify agent",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

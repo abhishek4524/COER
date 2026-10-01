@@ -1,0 +1,28 @@
+<svg width="400" height="260" viewBox="0 0 400 260" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="400" height="260" rx="20" fill="#FFFFFF"/>
+  <rect width="400" height="260" rx="20" stroke="#ECEAE5" stroke-width="2"/>
+  
+  <text x="30" y="45" font-family="Inter Tight, sans-serif" font-size="16" font-weight="700" fill="#1C1C1E">50 AI Testers Swarm Your App</text>
+  <text x="30" y="65" font-family="Inter, sans-serif" font-size="12" fill="#6B6B70">Simulating diverse ages, tech literacy & devices</text>
+  
+  <!-- Avatar Grid representation -->
+  <circle cx="50" cy="110" r="18" fill="#6C63FF" fill-opacity="0.2"/>
+  <circle cx="100" cy="110" r="18" fill="#F08A7E" fill-opacity="0.2"/>
+  <circle cx="150" cy="110" r="18" fill="#8FB8A8" fill-opacity="0.2"/>
+  <circle cx="200" cy="110" r="18" fill="#6C63FF" fill-opacity="0.2"/>
+  <circle cx="250" cy="110" r="18" fill="#F08A7E" fill-opacity="0.2"/>
+  <circle cx="300" cy="110" r="18" fill="#8FB8A8" fill-opacity="0.2"/>
+  <circle cx="350" cy="110" r="18" fill="#6C63FF" fill-opacity="0.2"/>
+  
+  <circle cx="50" cy="160" r="18" fill="#F08A7E" fill-opacity="0.2"/>
+  <circle cx="100" cy="160" r="18" fill="#8FB8A8" fill-opacity="0.2"/>
+  <circle cx="150" cy="160" r="18" fill="#6C63FF" fill-opacity="0.2"/>
+  <circle cx="200" cy="160" r="18" fill="#F08A7E" fill-opacity="0.2"/>
+  <circle cx="250" cy="160" r="18" fill="#8FB8A8" fill-opacity="0.2"/>
+  <circle cx="300" cy="160" r="18" fill="#6C63FF" fill-opacity="0.2"/>
+  <circle cx="350" cy="160" r="18" fill="#F08A7E" fill-opacity="0.2"/>
+  
+  <!-- Status tag -->
+  <rect x="130" y="205" width="140" height="28" rx="14" fill="#6C63FF"/>
+  <text x="146" y="223" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="#FFFFFF">⚡ Live Parallel Test</text>
+</svg>

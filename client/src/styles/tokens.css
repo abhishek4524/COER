@@ -1,0 +1,104 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+:root {
+  --bg-color: #F7F6F3;
+  --surface-color: #FFFFFF;
+  --border-color: #ECEAE5;
+  --text-color: #1C1C1E;
+  --muted-color: #6B6B70;
+  --accent-color: #6C63FF;
+  --success-color: #8FB8A8;
+  --friction-color: #F08A7E;
+  --font-heading: 'Inter Tight', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --radius-card: 24px;
+}
+
+.dark {
+  --bg-color: #0F0F12;
+  --surface-color: #17171B;
+  --border-color: #26262F;
+  --text-color: #F2F2F7;
+  --muted-color: #98989F;
+  --accent-color: #827BFF;
+  --success-color: #9EC4B5;
+  --friction-color: #F08A7E;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  font-family: var(--font-body);
+  transition: background-color 0.3s ease, color 0.3s ease;
+  overflow-x: hidden;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+}
+
+/* Glassmorphism helpers */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.65);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(236, 234, 229, 0.6);
+}
+
+.dark .glass-panel {
+  background: rgba(23, 23, 27, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(38, 38, 47, 0.6);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid #ECEAE5;
+}
+
+.dark .glass-card {
+  background: rgba(23, 23, 27, 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid #26262F;
+}
+
+/* Marquee animation */
+@keyframes marquee {
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(-33.333%); }
+}
+
+.animate-marquee {
+  display: flex;
+  width: max-content;
+  animation: marquee 30s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(107, 107, 112, 0.2);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(107, 107, 112, 0.4);
+}
