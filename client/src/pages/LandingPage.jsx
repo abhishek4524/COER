@@ -7,6 +7,7 @@ import PersonaCarouselSection from '../components/landing/PersonaCarouselSection
 import ProductShowcaseSection from '../components/landing/ProductShowcaseSection';
 import StatsGridSection from '../components/landing/StatsGridSection';
 import HeatmapSliderSection from '../components/landing/HeatmapSliderSection';
+import PricingSection from '../components/landing/PricingSection';
 import FinalCTASection from '../components/landing/FinalCTASection';
 import Footer from '../components/landing/Footer';
 
@@ -39,7 +40,10 @@ export const LandingPage = () => {
         {/* 8. Before/After Heatmap Slider */}
         <HeatmapSliderSection />
 
-        {/* 9. Final CTA */}
+        {/* 9. Pricing Section */}
+        <PricingSection />
+
+        {/* 10. Final CTA */}
         <FinalCTASection />
       </main>
 

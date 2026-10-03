@@ -1,14 +1,14 @@
 /**
  * server/src/services/aggregator.js
  *
- * Rule-based friction detection + metrics aggregation.
- *
- * Exported functions:
- *   detectFriction(steps)        → { rageClicks, deadClicks, loops, deadEnds }
- *   buildHeatmapPoints(steps)    → HeatmapPoint[]
- *   buildRunMetrics(sessions)    → RunMetrics
- *   buildPerPersonaTypeScores(sessions, personas) → Record<tag, score>
- *   buildDropOffFunnel(sessions) → FunnelStep[]
+ * Metrics aggregation and rule-based friction detection:
+ * - Real click and rage click detection
+ * - Dead click detection
+ * - Navigation loop detection (same page repetition + 3-way backtrack cycle)
+ * - Deterministic friction score (0-100)
+ * - Frustration normalized to 0-100 everywhere
+ * - Primary CTA detection and ctaMissRate calculation
+ * - Drop-off funnel based on distinct page paths visited
  */
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -17,21 +17,15 @@ const RAGE_CLICK_RADIUS_PX = 40;
 const RAGE_CLICK_WINDOW_MS = 2000;
 const RAGE_CLICK_MIN_COUNT = 3;
 
-const DEAD_CLICK_TOLERANCE_MS = 1500; // wait this long for DOM change
-const LOOP_SAME_STATE_COUNT = 3;
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function dist(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
 
 /**
  * Identify rage-click clusters: 3+ clicks within 40px within 2s.
- * Returns an array of cluster objects.
  */
 export function detectRageClicks(steps) {
-  const clicks = steps.filter((s) => s.action === 'click' && s.x != null);
+  const clicks = steps.filter((s) => s.action === 'click' && s.x != null && s.y != null);
   const clusters = [];
   const used = new Set();
 
@@ -60,46 +54,70 @@ export function detectRageClicks(steps) {
 }
 
 /**
- * Identify dead clicks: clicks after which URL and page title didn't change
- * within the next step.
+ * Identify dead clicks: real clicks where neither URL nor DOM changed.
  */
 export function detectDeadClicks(steps) {
-  const deadClicks = [];
-  for (let i = 0; i < steps.length - 1; i++) {
-    const step = steps[i];
-    const next = steps[i + 1];
-    if (step.action !== 'click') continue;
-    const urlSame = step.url === next.url;
-    const titleSame = step.pageTitle === next.pageTitle;
-    if (urlSame && titleSame && !next.domChanged) {
-      deadClicks.push({
-        x: step.x,
-        y: step.y,
-        target: step.target,
-        personaName: step.personaName,
-        ts: step.ts,
-      });
-    }
-  }
-  return deadClicks;
+  return steps
+    .filter((s) => (s.action === 'click' || s.action === 'rage_click') && s.x != null && s.isDeadClick)
+    .map((s) => ({
+      x: s.x,
+      y: s.y,
+      target: s.target,
+      personaName: s.personaName,
+      ts: s.ts,
+    }));
 }
 
 /**
- * Identify navigation loops: same URL visited 3+ times in a row.
+ * Identify navigation loops:
+ * 1) 3 consecutive steps on the same URL with no state change
+ * 2) Backtracking: alternating between two pages 3 times (A -> B -> A -> B -> A -> B)
  */
 export function detectLoops(steps) {
   const loops = [];
+  if (!steps || steps.length < 3) return loops;
+
+  // 1) 3 consecutive steps on same URL
   let streak = 1;
   for (let i = 1; i < steps.length; i++) {
-    if (steps[i].url === steps[i - 1].url) {
+    if (steps[i].url && steps[i].url === steps[i - 1].url && !steps[i].domChanged) {
       streak++;
-      if (streak === LOOP_SAME_STATE_COUNT) {
-        loops.push({ url: steps[i].url, count: streak, stepIndex: i });
+      if (streak === 3) {
+        loops.push({
+          type: 'stagnation',
+          url: steps[i].url,
+          count: streak,
+          stepIndex: i,
+        });
       }
     } else {
       streak = 1;
     }
   }
+
+  // 2) Backtrack pattern (A -> B -> A -> B -> A -> B)
+  const urls = steps.map((s) => s.url).filter(Boolean);
+  for (let i = 0; i <= urls.length - 6; i++) {
+    const a = urls[i];
+    const b = urls[i + 1];
+    if (a && b && a !== b) {
+      if (
+        urls[i + 2] === a &&
+        urls[i + 3] === b &&
+        urls[i + 4] === a &&
+        urls[i + 5] === b
+      ) {
+        loops.push({
+          type: 'backtrack',
+          urls: [a, b],
+          count: 3,
+          stepIndex: i + 5,
+        });
+        i += 5; // skip detected loop
+      }
+    }
+  }
+
   return loops;
 }
 
@@ -113,136 +131,179 @@ export function detectDeadEnds(steps) {
 }
 
 /**
- * Run all friction detections and return a combined report.
+ * Deterministic Composite Friction Score (0-100)
+ * Computed in code from rage clicks, dead clicks, loops, failed actions, and abandonment rate.
  */
-export function detectFriction(steps) {
+export function computeFrictionScore({ rageClicks = [], deadClicks = [], loops = [], failedActions = [], totalSessions = 1, gaveUpCount = 0 }) {
+  if (totalSessions <= 0) return 0;
+
+  const ragePoints = (rageClicks.length || 0) * 15;
+  const deadPoints = (deadClicks.length || 0) * 8;
+  const loopPoints = (loops.length || 0) * 20;
+  const failedActionPoints = (failedActions.length || 0) * 12;
+
+  const actionFriction = (ragePoints + deadPoints + loopPoints + failedActionPoints) / Math.max(1, totalSessions);
+  const abandonmentRate = gaveUpCount / Math.max(1, totalSessions);
+  const abandonmentFriction = abandonmentRate * 45;
+
+  const composite = Math.round(actionFriction + abandonmentFriction);
+  return Math.min(100, Math.max(0, composite));
+}
+
+/**
+ * Run all friction detections on steps.
+ */
+export function detectFriction(steps = [], totalSessions = 1, gaveUpCount = 0) {
+  const rageClicks = detectRageClicks(steps);
+  const deadClicks = detectDeadClicks(steps);
+  const loops = detectLoops(steps);
+  const deadEnds = detectDeadEnds(steps);
+  const failedActions = steps.filter((s) => s.action === 'failed_action');
+
+  const frictionScore = computeFrictionScore({
+    rageClicks,
+    deadClicks,
+    loops,
+    failedActions,
+    totalSessions,
+    gaveUpCount,
+  });
+
   return {
-    rageClicks: detectRageClicks(steps),
-    deadClicks: detectDeadClicks(steps),
-    loops: detectLoops(steps),
-    deadEnds: detectDeadEnds(steps),
-    frictionScore: computeFrictionScore(steps),
+    rageClicks,
+    deadClicks,
+    loops,
+    deadEnds,
+    failedActions,
+    frictionScore,
   };
 }
 
 /**
- * Composite friction score 0-100.
- */
-function computeFrictionScore(steps) {
-  if (!steps.length) return 0;
-  const avgFrustration = steps.reduce((s, step) => s + (step.frustration || 0), 0) / steps.length;
-  // frustration is 0-10 in LLM output; scale to 0-100
-  return Math.min(100, Math.round(avgFrustration * 10));
-}
-
-// ─── Heatmap ──────────────────────────────────────────────────────────────────
-
-/**
  * Convert steps into heatmap data points.
+ * NEVER includes (640, 360) viewport center fallbacks.
  */
 export function buildHeatmapPoints(steps) {
   return steps
-    .filter((s) => s.x != null && s.y != null)
+    .filter((s) => s.x != null && s.y != null && (s.action === 'click' || s.action === 'rage_click'))
     .map((s) => ({
       x: s.x,
       y: s.y,
-      type: s.action === 'rage_click' ? 'rage'
-        : s.isDeadClick ? 'dead'
-        : s.action === 'scroll' ? 'scroll'
-        : 'click',
-      intensity: 1,
+      type: s.action === 'rage_click' ? 'rage' : s.isDeadClick ? 'dead' : 'click',
+      intensity: s.frustration > 60 ? 2 : 1,
       personaName: s.personaName,
       emotion: s.emotion,
       frustration: s.frustration,
+      url: s.url,
       ts: s.ts,
     }));
 }
 
-// ─── Run-level Metrics ────────────────────────────────────────────────────────
+/**
+ * Primary CTA Detection:
+ * On landing view, scans interactive elements to identify the primary Call-To-Action.
+ * Criteria:
+ * 1. Buttons or links with high-intent keywords ('buy', 'order', 'checkout', 'sign up', 'register', 'start', 'contact', 'create account')
+ * 2. Or the element with the largest visual area and prominent contrast
+ */
+export function detectPrimaryCTA(elements = []) {
+  if (!elements || elements.length === 0) return null;
+
+  const intentWords = ['buy', 'order', 'checkout', 'cart', 'sign up', 'signup', 'register', 'get started', 'contact', 'create account', 'proceed'];
+
+  // 1. Text keyword match
+  for (const el of elements) {
+    const text = (el.name || '').toLowerCase();
+    if (intentWords.some((w) => text.includes(w))) {
+      return el;
+    }
+  }
+
+  // 2. Fallback to largest button
+  const buttons = elements.filter((el) => el.role === 'button' || el.tag === 'button');
+  if (buttons.length > 0) {
+    buttons.sort((a, b) => ((b.bbox?.w || 0) * (b.bbox?.h || 0)) - ((a.bbox?.w || 0) * (a.bbox?.h || 0)));
+    return buttons[0];
+  }
+
+  return elements[0] || null;
+}
 
 /**
- * Aggregate metrics across all sessions of a run.
- * @param {Array} sessions  Array of session docs with `.steps` populated
+ * Aggregate run-level metrics across all sessions.
+ * All frustration values are strictly normalized to 0-100.
  */
-export function buildRunMetrics(sessions) {
-  if (!sessions.length) return defaultMetrics();
+export function buildRunMetrics(sessions = []) {
+  if (!sessions.length) {
+    return {
+      schemaVersion: 2,
+      taskSuccessRate: 0,
+      avgFrustration: 0,
+      avgSessionTime: 0,
+      ctaMissRate: 0,
+      frictionScore: 0,
+      completedCount: 0,
+      gaveUpCount: 0,
+      totalSessions: 0,
+      dropOffStep: null,
+      heatmapPoints: [],
+      frictionReport: { rageClicks: [], deadClicks: [], loops: [], deadEnds: [], frictionScore: 0 },
+    };
+  }
 
   const completed = sessions.filter((s) => s.outcome === 'completed');
-  const gaveUp = sessions.filter((s) => s.outcome === 'gave_up');
+  const gaveUp = sessions.filter((s) => s.outcome === 'gave_up' || s.outcome === 'failed' || s.outcome === 'abandoned');
+  const totalSessions = sessions.length;
 
-  const taskSuccessRate = Math.round((completed.length / sessions.length) * 100);
+  const taskSuccessRate = Math.round((completed.length / totalSessions) * 100);
+
+  // Average frustration strictly 0-100
+  const totalFrustration = sessions.reduce((sum, s) => sum + (s.frustrationScore || 0), 0);
+  const avgFrustration = Math.round(totalFrustration / totalSessions);
+
+  // Average duration
+  const validTimes = sessions.map((s) => s.totalTime).filter((t) => typeof t === 'number' && t > 0);
+  const avgSessionTime = validTimes.length
+    ? Math.round(validTimes.reduce((a, b) => a + b, 0) / validTimes.length)
+    : 0;
+
+  // ctaMissRate: % of sessions that never clicked primary CTA or reached goal
+  const missedCTACount = sessions.filter((s) => s.missedCTA).length;
+  const ctaMissRate = Math.round((missedCTACount / totalSessions) * 100);
 
   const allSteps = sessions.flatMap((s) => s.steps || []);
-  const avgFrustration = allSteps.length
-    ? Math.round(allSteps.reduce((acc, s) => acc + (s.frustration || 0), 0) / allSteps.length * 10)
-    : 0;
-
-  const totalTimes = sessions
-    .filter((s) => s.totalTime > 0)
-    .map((s) => s.totalTime);
-  const avgSessionTime = totalTimes.length
-    ? Math.round(totalTimes.reduce((a, b) => a + b, 0) / totalTimes.length)
-    : 0;
-
-  const ctaMissRate = allSteps.length
-    ? Math.round((allSteps.filter((s) => s.action === 'dead_click' || s.isDeadClick).length / allSteps.length) * 100)
-    : 0;
-
-  // Drop-off step = most common last step index among give_up sessions
-  const dropOffCounts = {};
-  gaveUp.forEach((sess) => {
-    const lastStep = (sess.steps || []).length;
-    dropOffCounts[lastStep] = (dropOffCounts[lastStep] || 0) + 1;
-  });
-  const dropOffStep = Object.entries(dropOffCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-
+  const frictionReport = detectFriction(allSteps, totalSessions, gaveUp.length);
   const heatmapPoints = buildHeatmapPoints(allSteps);
-  const frictionReport = detectFriction(allSteps);
 
   return {
+    schemaVersion: 2,
     taskSuccessRate,
     avgFrustration,
     avgSessionTime,
     ctaMissRate,
+    frictionScore: frictionReport.frictionScore,
     completedCount: completed.length,
     gaveUpCount: gaveUp.length,
-    totalSessions: sessions.length,
-    dropOffStep: dropOffStep ? Number(dropOffStep) : null,
+    totalSessions,
     heatmapPoints,
     frictionReport,
   };
 }
 
-function defaultMetrics() {
-  return {
-    taskSuccessRate: 0,
-    avgFrustration: 0,
-    avgSessionTime: 0,
-    ctaMissRate: 0,
-    completedCount: 0,
-    gaveUpCount: 0,
-    totalSessions: 0,
-    dropOffStep: null,
-    heatmapPoints: [],
-    frictionReport: { rageClicks: [], deadClicks: [], loops: [], deadEnds: [], frictionScore: 0 },
-  };
-}
-
-// ─── Per-persona-type Scores ──────────────────────────────────────────────────
-
 /**
- * Group sessions by persona tag and compute success rate + avg frustration per group.
- * @param {Array} sessions  Sessions with `.personaSnapshot.tag`
+ * Group sessions by persona tag and calculate success rate and 0-100 avg frustration.
  */
-export function buildPerPersonaTypeScores(sessions) {
+export function buildPerPersonaTypeScores(sessions = []) {
+  if (!sessions.length) return [];
+
   const byTag = {};
 
   for (const sess of sessions) {
-    const tag = sess.personaSnapshot?.tag || 'Unknown';
+    const tag = sess.personaSnapshot?.tag || 'General';
     if (!byTag[tag]) byTag[tag] = { completed: 0, total: 0, frustrationSum: 0 };
     byTag[tag].total++;
     if (sess.outcome === 'completed') byTag[tag].completed++;
-    byTag[tag].frustrationSum += sess.frustrationScore || 0;
+    byTag[tag].frustrationSum += (sess.frustrationScore || 0);
   }
 
   return Object.entries(byTag).map(([tag, data]) => ({
@@ -253,27 +314,76 @@ export function buildPerPersonaTypeScores(sessions) {
   }));
 }
 
-// ─── Drop-off Funnel ──────────────────────────────────────────────────────────
-
 /**
- * Build a funnel showing how many personas reached each step.
- * @param {Array} sessions  Sessions with `.steps` populated
+ * Build Funnel based on distinct page paths visited with session counts per path.
  */
-export function buildDropOffFunnel(sessions) {
+export function buildDropOffFunnel(sessions = []) {
   if (!sessions.length) return [];
 
-  // Find the max step count across all sessions
-  const maxSteps = Math.max(...sessions.map((s) => (s.steps || []).length));
+  const totalSessions = sessions.length;
+  // Map of pathname -> Set of sessionIds that reached it
+  const pathSessionMap = new Map();
+  const pathOrder = [];
 
-  const funnel = [];
-  for (let i = 0; i <= maxSteps; i++) {
-    const reached = sessions.filter((s) => (s.steps || []).length > i).length;
-    funnel.push({
-      step: i,
-      label: `Step ${i + 1}`,
-      count: reached,
-      pct: Math.round((reached / sessions.length) * 100),
-    });
+  for (const session of sessions) {
+    const sId = session._id?.toString() || session.id;
+    const steps = session.steps || [];
+
+    const visitedInSession = new Set();
+    for (const step of steps) {
+      if (!step.url) continue;
+      let pathname = '/';
+      try {
+        const u = new URL(step.url);
+        pathname = u.pathname || '/';
+      } catch {
+        pathname = step.url;
+      }
+
+      if (!visitedInSession.has(pathname)) {
+        visitedInSession.add(pathname);
+        if (!pathSessionMap.has(pathname)) {
+          pathSessionMap.set(pathname, new Set());
+          pathOrder.push(pathname);
+        }
+        pathSessionMap.get(pathname).add(sId);
+      }
+    }
   }
-  return funnel;
+
+  // If no steps had URLs (e.g. initial state), create a fallback root stage
+  if (pathOrder.length === 0) {
+    return [{
+      stage: 'Landing Page (/)',
+      count: totalSessions,
+      pct: 100,
+    }];
+  }
+
+  return pathOrder.map((pathname, idx) => {
+    const count = pathSessionMap.get(pathname)?.size || 0;
+    const label = pathname === '/'
+      ? 'Landing Page (/)'
+      : pathname.slice(1).replace(/[-_/]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) + ` (${pathname})`;
+
+    return {
+      stage: label,
+      count,
+      pct: Math.round((count / totalSessions) * 100),
+    };
+  });
 }
+
+export default {
+  detectRageClicks,
+  detectDeadClicks,
+  detectLoops,
+  detectDeadEnds,
+  computeFrictionScore,
+  detectFriction,
+  buildHeatmapPoints,
+  detectPrimaryCTA,
+  buildRunMetrics,
+  buildPerPersonaTypeScores,
+  buildDropOffFunnel,
+};

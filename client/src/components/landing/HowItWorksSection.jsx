@@ -34,7 +34,7 @@ export const HowItWorksSection = () => {
       <div className="text-center max-w-3xl mx-auto mb-16 space-y-4">
         <Badge variant="accent">3 Simple Steps</Badge>
         <h2 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold font-heading text-[#1C1C1E] dark:text-[#F2F2F7]">
-          How Personify works
+          How VibeTest works
         </h2>
         <p className="text-base sm:text-lg text-[#6B6B70] dark:text-[#98989F]">
           From URL input to detailed usability insight in under 3 minutes.

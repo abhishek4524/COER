@@ -114,19 +114,26 @@ export const InteractiveHeatmap = ({ runId }) => {
   // ─── Filtered hotspots based on persona type & outcome ────────────────────
   const currentHotspots = useMemo(() => {
     if (!screenData) return [];
-    let list = screenData.hotspots;
+    let list = [];
 
-    if (mode === 'rage') {
-      list = list.filter(h => h.type === 'rage' || h.rageClicks > 6);
-    } else if (mode === 'dead') {
-      list = list.filter(h => h.type === 'dead');
+    if (Array.isArray(screenData.hotspots) && screenData.hotspots.length > 0) {
+      list = [...screenData.hotspots];
+    } else if (Array.isArray(screenData.clickPoints) && screenData.clickPoints.length > 0) {
+      list = screenData.clickPoints.map((pt, idx) => ({
+        id: `pt-${idx}`,
+        cx: pt.x,
+        cy: pt.y,
+        baseClicks: 15,
+        rageClicks: pt.type === 'rage' ? 12 : 0,
+        type: pt.type,
+        label: `Click (${pt.x}, ${pt.y})`,
+      }));
     }
 
-    // Adjust intensity/clicks by outcome filter
-    if (outcomeFilter === 'abandoned') {
-      list = list.map(h => ({ ...h, baseClicks: Math.round(h.baseClicks * 0.75) }));
-    } else if (outcomeFilter === 'completed') {
-      list = list.map(h => ({ ...h, rageClicks: Math.round(h.rageClicks * 0.3) }));
+    if (mode === 'rage') {
+      list = list.filter(h => h.type === 'rage' || (h.rageClicks || 0) > 0);
+    } else if (mode === 'dead') {
+      list = list.filter(h => h.type === 'dead');
     }
 
     return list;
@@ -150,10 +157,10 @@ export const InteractiveHeatmap = ({ runId }) => {
 
     const scale = intensity / 85;
 
-    currentHotspots.forEach(h => {
+    (currentHotspots || []).forEach(h => {
       const px = (h.cx / 760) * W;
       const py = (h.cy / 480) * H;
-      const ptRadius = radius * (1 + (h.baseClicks / 100));
+      const ptRadius = radius * (1 + ((h.baseClicks || 10) / 100));
 
       const grad = ctx.createRadialGradient(px, py, 0, px, py, ptRadius);
 
@@ -175,7 +182,7 @@ export const InteractiveHeatmap = ({ runId }) => {
       ctx.fill();
 
       // Core white-hot spot for heavy clicks or rage clicks
-      if (h.rageClicks > 10 || h.baseClicks > 50) {
+      if ((h.rageClicks || 0) > 10 || (h.baseClicks || 0) > 50) {
         const core = ctx.createRadialGradient(px, py, 0, px, py, ptRadius * 0.35);
         core.addColorStop(0, `rgba(255, 255, 255, ${0.9 * scale})`);
         core.addColorStop(0.5, `rgba(240, 138, 126, ${0.7 * scale})`);
@@ -205,11 +212,11 @@ export const InteractiveHeatmap = ({ runId }) => {
 
       {/* ── 1. SCREEN SWITCHER (Pill Tabs with Thumbnail & Friction Dot) ── */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-        {screens.map(screen => {
+        {screens.map((screen, idx) => {
           const isSelected = screen.id === selectedScreenId;
           return (
             <button
-              key={screen.id}
+              key={screen.id ? `${screen.id}-${idx}` : `scr-${idx}`}
               onClick={() => setSelectedScreenId(screen.id)}
               className={`relative flex items-center gap-2.5 px-3.5 py-2 rounded-full border text-xs font-semibold shrink-0 transition-all duration-300
                 ${isSelected
@@ -417,9 +424,9 @@ export const InteractiveHeatmap = ({ runId }) => {
               {/* ── 3. MODE: RAGE CLUSTERS (Dashed Pulsing Coral Rings) ── */}
               {mode === 'rage' && (
                 <div className="absolute inset-0 pointer-events-none">
-                  {currentHotspots.filter(h => h.isRageCluster || h.rageClicks > 12).map(cluster => (
+                  {currentHotspots.filter(h => h.isRageCluster || (h.rageClicks || 0) > 12).map((cluster, idx) => (
                     <div
-                      key={cluster.id}
+                      key={cluster.id ? `${cluster.id}-${idx}` : `rage-${idx}`}
                       className="absolute flex flex-col items-center"
                       style={{
                         left: `${(cluster.cx / 760) * 100}%`,
@@ -438,7 +445,7 @@ export const InteractiveHeatmap = ({ runId }) => {
                       />
                       {/* Cluster Label Badge */}
                       <span className="mt-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold text-white bg-[#F08A7E] shadow-md whitespace-nowrap">
-                        {cluster.rageClicks} rage clicks · {Math.round(cluster.rageClicks * 0.7)} personas
+                        {cluster.rageClicks || 12} rage clicks · {Math.round((cluster.rageClicks || 12) * 0.7)} personas
                       </span>
                     </div>
                   ))}
@@ -448,9 +455,9 @@ export const InteractiveHeatmap = ({ runId }) => {
               {/* ── 3. MODE: DEAD CLICKS (Hollow Ripple Markers) ── */}
               {mode === 'dead' && (
                 <div className="absolute inset-0 pointer-events-none">
-                  {currentHotspots.filter(h => h.type === 'dead').map(dc => (
+                  {currentHotspots.filter(h => h.type === 'dead').map((dc, idx) => (
                     <div
-                      key={dc.id}
+                      key={dc.id ? `${dc.id}-${idx}` : `dead-${idx}`}
                       className="absolute flex items-center justify-center"
                       style={{
                         left: `${(dc.cx / 760) * 100}%`,

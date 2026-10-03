@@ -45,7 +45,7 @@ export const StatsGridSection = () => {
           </h2>
 
           <p className="text-base sm:text-lg text-[#6B6B70] dark:text-[#98989F] leading-relaxed">
-            Standard analytics only show that 76% of visitors bounced. Personify shows you exact cognitive profiles: mobile users with low patience missed the button because it was below the fold on 375px screens.
+            Standard analytics only show that 76% of visitors bounced. VibeTest shows you exact cognitive profiles: mobile users with low patience missed the button because it was below the fold on 375px screens.
           </p>
 
           <div className="grid grid-cols-2 gap-4 pt-4 border-t border-[#ECEAE5] dark:border-[#26262F]">

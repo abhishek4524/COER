@@ -69,7 +69,7 @@ export const HeroSection = () => {
         >
           <div className="inline-flex items-center gap-2">
             <Badge variant="accent" pulse>
-              Introducing Personify 2.0
+              Introducing VibeTest 2.0
             </Badge>
             <span className="text-xs text-[#6B6B70] dark:text-[#98989F] font-medium">
               50 AI Testers Ready

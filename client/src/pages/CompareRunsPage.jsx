@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import { TrendingUp, TrendingDown, Minus, Eye, MousePointer, Flame, ChevronDown } from 'lucide-react';
 import Card from '../components/ui/Card';
 import Badge from '../components/ui/Badge';
-import { allRuns } from '../mock/sessions';
+import { getRuns, getRunReport } from '../services/api';
 
 // ─── Canvas heatmap renderer ────────────────────────────────────────────────
 const drawHeatmap = (canvas, points, filter) => {
@@ -147,12 +147,64 @@ const DeltaCard = ({ label, aVal, bVal, unit = '', higherIsBetter = true }) => {
 
 // ─── Main CompareRunsPage ──────────────────────────────────────────────────
 export const CompareRunsPage = () => {
-  const [runAId, setRunAId] = useState(allRuns[0]?.id ?? '');
-  const [runBId, setRunBId] = useState(allRuns[1]?.id ?? '');
+  const [allRuns, setAllRuns] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [runAId, setRunAId] = useState('');
+  const [runBId, setRunBId] = useState('');
+  const [runAReport, setRunAReport] = useState(null);
+  const [runBReport, setRunBReport] = useState(null);
   const [heatmapFilter, setHeatmapFilter] = useState('all');
 
-  const runA = allRuns.find(r => r.id === runAId);
-  const runB = allRuns.find(r => r.id === runBId);
+  // Load real runs from API
+  useEffect(() => {
+    getRuns().then((runs) => {
+      if (Array.isArray(runs) && runs.length > 0) {
+        setAllRuns(runs);
+        setRunAId(runs[0]?.id || runs[0]?._id || '');
+        setRunBId(runs[1]?.id || runs[1]?._id || runs[0]?.id || '');
+      }
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
+  // Fetch report for runA
+  useEffect(() => {
+    if (!runAId) return;
+    getRunReport(runAId).then((r) => {
+      if (r) setRunAReport({
+        id: runAId,
+        label: r.run?.url || runAId,
+        date: r.run?.createdAt ? new Date(r.run.createdAt).toLocaleDateString() : '',
+        color: '#6C63FF',
+        taskSuccess: r.metrics?.taskSuccessRate ?? 0,
+        avgFrustration: r.metrics?.avgFrustration ?? 0,
+        ctaMissRate: r.metrics?.ctaMissRate ?? 0,
+        personaCount: r.run?.personaCount ?? 0,
+        heatmapPoints: r.heatmapPoints || [],
+      });
+    });
+  }, [runAId]);
+
+  // Fetch report for runB
+  useEffect(() => {
+    if (!runBId || runBId === runAId) return;
+    getRunReport(runBId).then((r) => {
+      if (r) setRunBReport({
+        id: runBId,
+        label: r.run?.url || runBId,
+        date: r.run?.createdAt ? new Date(r.run.createdAt).toLocaleDateString() : '',
+        color: '#8FB8A8',
+        taskSuccess: r.metrics?.taskSuccessRate ?? 0,
+        avgFrustration: r.metrics?.avgFrustration ?? 0,
+        ctaMissRate: r.metrics?.ctaMissRate ?? 0,
+        personaCount: r.run?.personaCount ?? 0,
+        heatmapPoints: r.heatmapPoints || [],
+      });
+    });
+  }, [runBId]);
+
+  const runA = runAReport;
+  const runB = runBReport;
 
   const filters = [
     { key: 'all',    label: 'All',    icon: Eye },
@@ -173,12 +225,32 @@ export const CompareRunsPage = () => {
             bg-white dark:bg-[#17171B] text-sm text-[#1C1C1E] dark:text-[#F2F2F7]
             focus:outline-none focus:ring-2 focus:ring-[#6C63FF]/40 transition-all"
         >
-          {allRuns.map(r => <option key={r.id} value={r.id}>{r.label} — {r.date}</option>)}
+          {allRuns.map(r => (
+            <option key={r.id || r._id} value={r.id || r._id}>
+              {r.url || r.label || r.id} — {r.createdAt ? new Date(r.createdAt).toLocaleDateString() : ''}
+            </option>
+          ))}
         </select>
         <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#6B6B70] pointer-events-none" />
       </div>
     </div>
   );
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-64 text-[#6B6B70] dark:text-[#98989F] text-sm">Loading runs…</div>;
+  }
+
+  if (allRuns.length < 2) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-3 text-center">
+        <p className="text-lg font-semibold text-[#1C1C1E] dark:text-[#F2F2F7]">Not Enough Runs</p>
+        <p className="text-sm text-[#6B6B70] dark:text-[#98989F]">
+          You need at least 2 completed runs to compare. Start a new run from the{' '}
+          <a href="/app/new-run" className="text-[#6C63FF] underline">New Run page</a>.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-6">

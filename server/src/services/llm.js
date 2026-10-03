@@ -1,28 +1,30 @@
 /**
  * server/src/services/llm.js
- * Provider-agnostic LLM wrapper.
- * Default: Google Gemini via @google/generative-ai
- * Swap provider by setting LLM_PROVIDER=openai|anthropic in .env
+ * Provider-agnostic LLM wrapper supporting Gemini, OpenRouter, and grounded Mock.
  *
  * Exports:
  *   callLLM(systemPrompt, userPrompt, opts) → parsed JSON or string
- *   buildPageStatePrompt(pageState, persona, goal, history) → string
+ *   buildPageStatePrompt(pageState, persona, goal, history, extra) → string
+ *   buildSummaryPrompt(sessionFeedbacks, goal, url, pageAudits) → string
+ *   filterAndGroundedIssues(issues, sessionFeedbacks, pageAudits, totalSessions, visitedCorpus) → Issue[]
+ *   SUMMARY_SCHEMA
+ *   ACTION_SCHEMA
  */
 
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const PROVIDER = process.env.LLM_PROVIDER || 'gemini';
+const PROVIDER = process.env.LLM_PROVIDER || 'openrouter';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
 // OpenRouter config (set LLM_PROVIDER=openrouter)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-flash-1.5';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct';
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 2;
 const BASE_DELAY_MS = 1000;
 
 // ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -44,9 +46,9 @@ async function withRetry(fn, retries = MAX_RETRIES) {
   throw lastErr;
 }
 
-// ─── JSON schema for persona action ──────────────────────────────────────────
+// ─── JSON schema for persona action (Element-Index based) ──────────────────────
 
-const ACTION_SCHEMA = {
+export const ACTION_SCHEMA = {
   type: SchemaType.OBJECT,
   properties: {
     action: {
@@ -54,31 +56,46 @@ const ACTION_SCHEMA = {
       enum: ['click', 'type', 'scroll', 'wait', 'give_up', 'goal_complete'],
       description: 'The action to take',
     },
-    target: {
-      type: SchemaType.STRING,
-      description: 'CSS selector or accessible name of the target element',
+    elementIndex: {
+      type: SchemaType.NUMBER,
+      description: 'The 1-based index number of the target element from the interactive elements list (required if action is click or type)',
       nullable: true,
     },
     text: {
       type: SchemaType.STRING,
-      description: 'Text to type (only when action=type)',
+      description: 'Text to type into the input field (required if action is type)',
       nullable: true,
     },
     thought: {
       type: SchemaType.STRING,
-      description: 'First-person narration of what you are thinking',
+      description: 'First-person narration of what you are thinking in persona voice',
     },
     emotion: {
       type: SchemaType.STRING,
-      enum: ['neutral', 'curious', 'confused', 'frustrated', 'happy', 'angry'],
+      enum: ['neutral', 'curious', 'focused', 'confused', 'frustrated', 'happy', 'angry', 'gave_up'],
       description: 'Current emotional state',
     },
     frustration: {
       type: SchemaType.NUMBER,
-      description: 'Frustration level 0-10 (0=calm, 10=rage-quitting)',
+      description: 'Frustration level 0-10 (0=calm, 10=completely blocked/rage-quitting)',
     },
   },
   required: ['action', 'thought', 'emotion', 'frustration'],
+};
+
+export const SUMMARY_SCHEMA = {
+  type: SchemaType.ARRAY,
+  items: {
+    type: SchemaType.OBJECT,
+    properties: {
+      title: { type: SchemaType.STRING },
+      severity: { type: SchemaType.STRING, enum: ['critical', 'high', 'medium', 'low'] },
+      affectedCount: { type: SchemaType.NUMBER },
+      description: { type: SchemaType.STRING },
+      suggestedFix: { type: SchemaType.STRING },
+    },
+    required: ['title', 'severity', 'affectedCount', 'description', 'suggestedFix'],
+  },
 };
 
 // ─── Gemini provider ──────────────────────────────────────────────────────────
@@ -101,7 +118,7 @@ async function callGemini(systemPrompt, userPrompt, opts = {}) {
     generationConfig: {
       responseMimeType: 'application/json',
       responseSchema: opts.schema || ACTION_SCHEMA,
-      temperature: opts.temperature ?? 0.7,
+      temperature: opts.temperature ?? 0.6,
       maxOutputTokens: opts.maxTokens ?? 1024,
     },
   });
@@ -110,8 +127,6 @@ async function callGemini(systemPrompt, userPrompt, opts = {}) {
   const text = result.response.text();
   return JSON.parse(text);
 }
-
-// ─── Free-text Gemini call (no schema enforcement) ────────────────────────────
 
 async function callGeminiText(systemPrompt, userPrompt, opts = {}) {
   const client = getGeminiClient();
@@ -127,86 +142,62 @@ async function callGeminiText(systemPrompt, userPrompt, opts = {}) {
   return result.response.text();
 }
 
-// ─── OpenRouter provider (OpenAI-compatible) ──────────────────────────────────
-
-// Models that do NOT support response_format: json_object
-const NO_JSON_FORMAT_MODELS = [
-  'nvidia/', 'meta-llama/', 'mistralai/mistral-7b', 'nousresearch/',
-];
-
-function modelSupportsJsonFormat(model) {
-  return !NO_JSON_FORMAT_MODELS.some((prefix) => model.startsWith(prefix));
-}
+// ─── OpenRouter provider ──────────────────────────────────────────────────────
 
 function extractJson(text) {
   if (!text) throw new Error('Empty text');
 
   // 1. Check markdown code blocks
-  const fenced = text.match(/```(?:\w+)?\s*([\s\S]+?)```/);
+  const fenced = text.match(/```(?:json)?\s*([\s\S]+?)```/i);
   if (fenced) {
     try {
       return JSON.parse(fenced[1].trim());
-    } catch {
-      // fallback to bracket extraction
-    }
+    } catch {}
   }
 
-  // 2. Extract substring between first `{` and last `}`
+  // 2. Extract between first `{` and last `}`
   const firstObj = text.indexOf('{');
   const lastObj = text.lastIndexOf('}');
   if (firstObj !== -1 && lastObj > firstObj) {
-    const candidate = text.slice(firstObj, lastObj + 1);
     try {
-      return JSON.parse(candidate);
-    } catch {
-      // continue
-    }
+      return JSON.parse(text.slice(firstObj, lastObj + 1));
+    } catch {}
   }
 
-  // 3. Extract substring between first `[` and last `]`
+  // 3. Extract between first `[` and last `]`
   const firstArr = text.indexOf('[');
   const lastArr = text.lastIndexOf(']');
   if (firstArr !== -1 && lastArr > firstArr) {
-    const candidate = text.slice(firstArr, lastArr + 1);
     try {
-      return JSON.parse(candidate);
-    } catch {
-      // continue
-    }
+      return JSON.parse(text.slice(firstArr, lastArr + 1));
+    } catch {}
   }
 
-  // 4. Direct parse fallback
+  // Direct parse fallback
   return JSON.parse(text.trim());
 }
 
 async function callOpenRouter(systemPrompt, userPrompt, opts = {}) {
   if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY is not set in .env');
 
-  // For models that don't support json_object mode, inject instruction into system prompt
-  const supportsJsonFormat = modelSupportsJsonFormat(OPENROUTER_MODEL);
-  const effectiveSystem = (!opts.freeText && !supportsJsonFormat)
-    ? systemPrompt + '\n\nIMPORTANT: You MUST respond with ONLY valid JSON. No markdown, no explanation, no code fences. Just the raw JSON object.'
-    : systemPrompt;
+  const jsonInstruction = opts.freeText
+    ? ''
+    : '\n\nCRITICAL: Respond ONLY with valid JSON (no markdown formatting, no code fences, no extra text).';
 
   const messages = [
-    { role: 'system', content: effectiveSystem },
+    { role: 'system', content: systemPrompt + jsonInstruction },
     { role: 'user', content: userPrompt },
   ];
 
   const body = {
     model: OPENROUTER_MODEL,
     messages,
-    temperature: opts.temperature ?? 0.7,
+    temperature: opts.temperature ?? 0.5,
     max_tokens: opts.maxTokens ?? 1024,
   };
 
-  // Only add response_format for models that support it
-  if (!opts.freeText && supportsJsonFormat) {
-    body.response_format = { type: 'json_object' };
-  }
-
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15_000);
+  const timeoutId = setTimeout(() => controller.abort(), 20_000);
 
   let res;
   try {
@@ -234,212 +225,149 @@ async function callOpenRouter(systemPrompt, userPrompt, opts = {}) {
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error('OpenRouter returned empty content');
 
-  if (opts.freeText) return content;
+  if (opts.freeText) return content.trim();
 
-  try {
-    return extractJson(content);
-  } catch (parseErr) {
-    console.warn('[LLM] JSON parse failed, raw content:', content.slice(0, 200));
-    throw new Error(`OpenRouter JSON parse error: ${parseErr.message}`);
-  }
+  return extractJson(content);
 }
 
-
-// ─── Mock provider (context-aware for demo site, no API key needed) ──────────
-
-let _mockStepCount = 0;
+// ─── Clean Grounded Mock provider (NO HARDCODED LEAKS) ─────────────────────────
 
 async function callMock(systemPrompt, userPrompt, opts = {}) {
-  await new Promise((r) => setTimeout(r, 150)); // simulate realistic API latency
+  await new Promise((r) => setTimeout(r, 100));
 
-  // 1. Clustered Summary call
+  // 1. Summary call: derive strictly from page audit or feedback mentioned in userPrompt
   if (opts.schema === SUMMARY_SCHEMA || userPrompt.includes('Test Summary Request')) {
-    return [
-      {
-        title: 'Misleading Jargon & Low-Contrast Primary CTA',
-        severity: 'critical',
-        affectedCount: 3,
-        description: 'Users struggled with "Initiate SKU Acquirement Workflow" and the 9px low-contrast button, causing rage clicks and hesitation on product selection.',
-        suggestedFix: 'Replace jargon with a clear 14px "Buy Now" button in primary accent #6C63FF.',
-      },
-      {
-        title: 'Unlabeled Email Field & Silent Form Errors',
+    const totalMatch = userPrompt.match(/Total sessions:\s*(\d+)/);
+    const total = totalMatch ? Number(totalMatch[1]) : 1;
+    const issues = [];
+
+    if (userPrompt.includes('font') || userPrompt.includes('size')) {
+      issues.push({
+        title: 'Small and Low-Legibility Text / Action Elements',
         severity: 'high',
-        affectedCount: 2,
-        description: 'The email input lacked a visible label and used cryptic placeholder text ("Enter requisite email datum"). Form reset on validation failure without feedback.',
-        suggestedFix: 'Add explicit <label> for Email Address and display inline field validation error banners.',
-      },
-      {
-        title: 'Disabled-looking "Fulfilment Matrix" Checkout CTA',
+        affectedCount: Math.min(total, 2),
+        description: 'Several elements on the page use a font size below the standard readable threshold, causing hesitation.',
+        suggestedFix: 'Increase font sizes to a minimum of 14px on all interactive elements.',
+      });
+    }
+
+    if (userPrompt.includes('label') || userPrompt.includes('missing')) {
+      issues.push({
+        title: 'Missing Input Labels',
+        severity: 'high',
+        affectedCount: Math.min(total, 1),
+        description: 'Input fields lack visible labels, causing users to guess required formats.',
+        suggestedFix: 'Add clear, persistent <label> tags to all form controls.',
+      });
+    }
+
+    if (issues.length === 0) {
+      issues.push({
+        title: 'Navigation and Discovery Friction',
         severity: 'medium',
-        affectedCount: 2,
-        description: 'The checkout submit button is grey (#bdc3c7), styled like a disabled button, causing users to think they missed a required step.',
-        suggestedFix: 'Style the final checkout button in high-contrast emerald green with text "Place Order (₹4,302)".',
-      },
-    ];
+        affectedCount: Math.min(total, 1),
+        description: 'Testers spent unexpected time locating the primary path to complete their goal.',
+        suggestedFix: 'Highlight the primary call to action with distinct visual hierarchy.',
+      });
+    }
+
+    return issues;
   }
 
   // 2. Free-text feedback review
   if (opts.freeText) {
-    if (systemPrompt.includes('Sharma') || systemPrompt.includes('senior')) {
-      return "The words used here were so confusing! What is 'SKU Acquirement Workflow'? The buttons are too small to read and the form gave me an error without explaining what I did wrong.";
+    if (userPrompt.includes('outcome was: completed')) {
+      return 'I was able to locate the information and complete my goal, though navigating the layout could be more intuitive.';
     }
-    if (systemPrompt.includes('Riya') || systemPrompt.includes('teen')) {
-      return "Why is checkout so slow and complicated? That grey button looked broken. Just give me Apple Pay or UPI directly.";
-    }
-    return "The flow was confusing at several stages. The checkout button looks disabled and terminology like 'Fulfilment Matrix' is unnecessary.";
+    return 'I had difficulty finding the required elements on the page to complete my goal.';
   }
 
-  // 3. Step action decision based on page state in userPrompt
-  _mockStepCount++;
-  const urlMatch = userPrompt.match(/URL:\s*(https?:\/\/[^\s\n]+)/);
-  const currentUrl = urlMatch ? urlMatch[1] : '';
-  const isSenior = systemPrompt.includes('Sharma') || systemPrompt.includes('Senior');
+  // 3. Step action decision based on element list in userPrompt
+  const elementsMatch = userPrompt.match(/\[(\d+)\]\s*<([^>]+)>\s*"([^"]*)"/g);
+  let pickedIndex = 1;
+  let pickedAction = 'click';
 
-  // Product Page (/)
-  if (currentUrl.endsWith(':3456/') || currentUrl.endsWith(':3456')) {
-    if (isSenior && _mockStepCount % 2 === 1) {
-      return {
-        action: 'click',
-        target: 'Initiate SKU Acquirement Workflow',
-        thought: 'I cannot find the simple buy button. What does SKU mean? Trying this tiny link.',
-        emotion: 'confused',
-        frustration: 6,
-      };
-    }
+  if (elementsMatch && elementsMatch.length > 0) {
+    // Pick the first clickable element or scroll
+    pickedIndex = 1;
+    pickedAction = 'click';
+  } else {
+    pickedAction = 'scroll';
+  }
+
+  return {
+    action: pickedAction,
+    elementIndex: pickedIndex,
+    text: null,
+    thought: 'Examining the visible elements to proceed toward my goal.',
+    emotion: 'curious',
+    frustration: 2,
+  };
+}
+
+// ─── Normalizer for action decision ──────────────────────────────────────────
+
+export function normalizeActionOutput(raw, elements = []) {
+  if (!raw || typeof raw !== 'object') {
     return {
-      action: 'click',
-      target: 'Create Account to Buy',
-      thought: 'I want to purchase the headphones. Clicking Create Account to Buy.',
-      emotion: 'curious',
+      action: 'wait',
+      elementIndex: null,
+      text: null,
+      thought: 'Observing the page.',
+      emotion: 'neutral',
       frustration: 2,
     };
   }
 
-  // Signup Page (/signup)
-  if (currentUrl.includes('/signup')) {
-    const hasEmail = userPrompt.includes('requisite email datum') || userPrompt.includes('name="email"');
-    const stepInPage = _mockStepCount % 6;
+  const validActions = ['click', 'type', 'scroll', 'wait', 'give_up', 'goal_complete'];
+  let action = String(raw.action || '').toLowerCase().trim();
 
-    if (stepInPage === 0) {
-      return {
-        action: 'type',
-        target: 'input[name="email"]',
-        text: 'tester.personify@example.com',
-        thought: 'Entering my email into this unlabeled box.',
-        emotion: 'neutral',
-        frustration: 3,
-      };
-    }
-    if (stepInPage === 1) {
-      return {
-        action: 'type',
-        target: 'input#password',
-        text: 'SecureP@ssw0rd2026!',
-        thought: 'Entering a 12-character password as requested.',
-        emotion: 'neutral',
-        frustration: 2,
-      };
-    }
-    if (stepInPage === 2) {
-      return {
-        action: 'type',
-        target: 'input#fullname',
-        text: 'Alex Morgan',
-        thought: 'Typing my full name.',
-        emotion: 'neutral',
-        frustration: 1,
-      };
-    }
-    if (stepInPage === 3) {
-      return {
-        action: 'click',
-        target: 'input#agree',
-        thought: 'Checking the Terms and Conditions agreement box.',
-        emotion: 'neutral',
-        frustration: 3,
-      };
-    }
-    return {
-      action: 'click',
-      target: 'Register Entity',
-      thought: 'Submitting the registration form.',
-      emotion: isSenior ? 'frustrated' : 'curious',
-      frustration: isSenior ? 7 : 3,
-    };
+  // If action contains spaces or phrases like "click button" or "proceed"
+  if (!validActions.includes(action)) {
+    if (action.includes('click')) action = 'click';
+    else if (action.includes('type') || action.includes('enter') || action.includes('fill')) action = 'type';
+    else if (action.includes('scroll')) action = 'scroll';
+    else if (action.includes('give') || action.includes('quit') || action.includes('abort')) action = 'give_up';
+    else if (action.includes('complete') || action.includes('finish') || action.includes('success')) action = 'goal_complete';
+    else action = 'wait';
   }
 
-  // Checkout Page (/checkout)
-  if (currentUrl.includes('/checkout')) {
-    const checkoutStep = _mockStepCount % 4;
-
-    if (checkoutStep === 0) {
-      return {
-        action: 'type',
-        target: 'input[name="address"]',
-        text: '124 Park Avenue, Suite 4B',
-        thought: 'Filling in delivery address.',
-        emotion: 'neutral',
-        frustration: 2,
-      };
-    }
-    if (checkoutStep === 1) {
-      return {
-        action: 'type',
-        target: 'input[name="city"]',
-        text: 'Bengaluru',
-        thought: 'Filling in city.',
-        emotion: 'neutral',
-        frustration: 2,
-      };
-    }
-    if (checkoutStep === 2 && isSenior) {
-      return {
-        action: 'click',
-        target: 'Proceed to Fulfilment Matrix',
-        thought: 'This button is grey, is it disabled? Clicking it anyway.',
-        emotion: 'frustrated',
-        frustration: 8,
-      };
-    }
-    return {
-      action: 'click',
-      target: 'Proceed to Fulfilment Matrix',
-      thought: 'Proceeding to complete the order.',
-      emotion: 'curious',
-      frustration: 4,
-    };
+  // Normalize elementIndex
+  let elementIndex = null;
+  if (raw.elementIndex != null) {
+    const parsed = parseInt(raw.elementIndex, 10);
+    if (!isNaN(parsed) && parsed > 0) elementIndex = parsed;
   }
 
-  // Success Page (/success)
-  if (currentUrl.includes('/success')) {
-    return {
-      action: 'goal_complete',
-      target: null,
-      thought: 'Order placed successfully! Task is complete.',
-      emotion: 'happy',
-      frustration: 1,
-    };
+  // Normalize frustration (0 - 10)
+  let frustration = 0;
+  if (typeof raw.frustration === 'number') {
+    frustration = raw.frustration;
+  } else if (typeof raw.frustration === 'string') {
+    const num = parseFloat(raw.frustration);
+    frustration = isNaN(num) ? 3 : num;
   }
+  // If LLM returned 0-100 scale by mistake, divide by 10
+  if (frustration > 10) frustration = Math.round(frustration / 10);
+  frustration = Math.min(10, Math.max(0, Math.round(frustration)));
 
-  // Fallback action
+  // Normalize emotion
+  const validEmotions = ['neutral', 'curious', 'focused', 'confused', 'frustrated', 'happy', 'satisfied', 'angry', 'gave_up'];
+  let emotion = String(raw.emotion || 'neutral').toLowerCase().trim();
+  if (!validEmotions.includes(emotion)) emotion = frustration >= 7 ? 'frustrated' : 'neutral';
+
   return {
-    action: 'scroll',
-    target: null,
-    thought: 'Looking around the page for next steps.',
-    emotion: 'neutral',
-    frustration: 3,
+    action,
+    elementIndex,
+    text: raw.text ? String(raw.text) : null,
+    thought: String(raw.thought || 'Navigating page…').slice(0, 300),
+    emotion,
+    frustration,
   };
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/**
- * Call the LLM and return a parsed JSON action object.
- * @param {string} systemPrompt
- * @param {string} userPrompt
- * @param {object} opts  { schema, temperature, maxTokens, freeText }
- */
 export async function callLLM(systemPrompt, userPrompt, opts = {}) {
   try {
     return await withRetry(async () => {
@@ -454,61 +382,93 @@ export async function callLLM(systemPrompt, userPrompt, opts = {}) {
     }, 2);
   } catch (err) {
     if (PROVIDER !== 'mock') {
-      console.warn(`[LLM] Provider '${PROVIDER}' failed (${err.message}). Falling back to mock generator.`);
+      console.warn(`[LLM] Provider '${PROVIDER}' error (${err.message}). Falling back to safe mock generator.`);
       return callMock(systemPrompt, userPrompt, opts);
     }
     throw err;
   }
 }
 
-
 /**
- * Build the user-turn prompt from page state + history.
+ * Build the user-turn prompt with element-index list, last action result, and loop avoidance.
  */
-export function buildPageStatePrompt(pageState, persona, goal, history = []) {
+export function buildPageStatePrompt(pageState, persona, goal, history = [], extra = {}) {
+  const { lastActionResult, recentVisitedUrls = [], repeatWarning = null } = extra;
+
   const historyStr = history.length
     ? history.map((h, i) =>
-        `Step ${i + 1}: [${h.action}] ${h.target || ''} → thought: "${h.thought}" emotion: ${h.emotion} frustration: ${h.frustration}/10`
+        `Step ${i + 1}: [${h.action}${h.elementIndex ? ` #${h.elementIndex}` : ''}] ${h.target || ''} → thought: "${h.thought}" (frustration: ${h.frustration}/10)`
       ).join('\n')
-    : 'No previous steps.';
+    : 'No previous steps taken.';
 
-  const elementsStr = pageState.elements
-    .slice(0, 30) // cap at 30 elements to stay within token limits
+  const elementsStr = (pageState.elements || [])
     .map((el) =>
-      `- [${el.role}] "${el.name}" selector="${el.selector}" bbox=[${el.bbox.x},${el.bbox.y},${el.bbox.w},${el.bbox.h}] fontSize=${el.fontSize}px`
+      `[${el.index}] <${el.tag || el.role}> "${el.name}" role=${el.role} fontSize=${el.fontSize}px bbox=[${el.bbox.x},${el.bbox.y},${el.bbox.w},${el.bbox.h}]`
     )
     .join('\n');
 
+  const visitedStr = recentVisitedUrls.length > 0
+    ? recentVisitedUrls.join(' → ')
+    : pageState.url;
+
   return `
-## Current Page
+## Current Page State
 URL: ${pageState.url}
 Title: ${pageState.title}
-Visible text excerpt: ${pageState.visibleText.slice(0, 600)}
+Visible Text Excerpt: ${pageState.visibleText.slice(0, 600)}
 
-## Interactive Elements (top 30)
-${elementsStr || 'None detected'}
+## Numbered Interactive Elements (choose by [index])
+${elementsStr || 'None detected on this view'}
 
-## Goal
+## Your Goal
 ${goal}
 
-## Your recent history (last ${history.length} steps)
+## Previous Action Result
+${lastActionResult || 'Starting test session.'}
+
+## Recent Visited Pages
+${visitedStr}
+${repeatWarning ? `\n⚠️ WARNING: ${repeatWarning}\n` : ''}
+
+## Step History (last ${history.length} steps)
 ${historyStr}
 
-## Your task
-Decide your next action as ${persona.name}. Reply ONLY with the JSON action object.
-Remember:
-- If you cannot find the right element after 3 confused steps, use action: "give_up".
-- If the goal is fully achieved, use action: "goal_complete".
-- frustration is 0-10 (not 0-100).
+## Decision Instructions
+You are ${persona.name} (${persona.role || 'tester'}, age ${persona.age || 30}).
+Decide your next action. Reply ONLY with the JSON action object.
+
+JSON Schema:
+{
+  "action": "click" | "type" | "scroll" | "wait" | "give_up" | "goal_complete",
+  "elementIndex": <number: the 1-based [index] from the list above, required if action is click or type>,
+  "text": <string: required if action is type>,
+  "thought": "<first-person thought expressing your reaction>",
+  "emotion": "neutral" | "curious" | "focused" | "confused" | "frustrated" | "happy" | "angry",
+  "frustration": <number: 0 to 10>
+}
+
+Rules:
+- To click or type, you MUST provide "elementIndex" matching one of the [index] numbers from the list above.
+- If you have successfully achieved the testing goal, use "action": "goal_complete".
+- If you are completely stuck, confused after 3 attempts, or the page is broken, use "action": "give_up".
+- "frustration" must be a number between 0 and 10.
 `.trim();
 }
 
 /**
- * Build a summary prompt from all session feedback.
+ * Build a summary prompt with measured facts and strict grounding constraints.
  */
-export function buildSummaryPrompt(sessionFeedbacks, goal, url) {
+export function buildSummaryPrompt(sessionFeedbacks, goal, url, pageAudits = []) {
   const feedbackList = sessionFeedbacks
-    .map((f, i) => `[${f.personaName}, ${f.outcome}] ${f.feedback}`)
+    .map((f, i) => `[Tester ${i + 1}: ${f.personaName}, outcome: ${f.outcome}] "${f.feedback}"`)
+    .join('\n');
+
+  // Format measured findings from page audits
+  const auditFindingsStr = (pageAudits || [])
+    .flatMap((audit) =>
+      (audit.findings || []).map((f) => `- [${audit.pathname}] ${f.type.toUpperCase()}: ${f.detail} (element: "${f.element}", text: "${f.text}")`)
+    )
+    .slice(0, 20)
     .join('\n');
 
   return `
@@ -517,31 +477,119 @@ URL tested: ${url}
 Goal: ${goal}
 Total sessions: ${sessionFeedbacks.length}
 
-## Persona Feedback (raw)
-${feedbackList}
+## Measured Page Audit Findings (Automated Facts)
+${auditFindingsStr || 'No automated audit violations found.'}
 
-Cluster this feedback into the top 3 UX issues. For each issue return:
-- title: short issue label
-- severity: critical | high | medium | low
-- affectedCount: number of personas affected
-- description: 1-2 sentence explanation
+## Persona Feedback (Real Tester Quotes)
+${feedbackList || 'No feedback recorded.'}
+
+## Task
+Cluster the findings into the top 3 UX issues. For each issue return:
+- title: concise descriptive label
+- severity: "critical" | "high" | "medium" | "low"
+- affectedCount: number of personas affected (MUST be between 1 and ${sessionFeedbacks.length})
+- description: 1-2 sentence evidence-backed explanation citing specific pages or elements
 - suggestedFix: concrete actionable fix
+
+CRITICAL GROUNDING RULES:
+1. You MUST cite ONLY elements, buttons, text, and findings that appear in the Measured Facts or Persona Feedback above.
+2. DO NOT invent strings, buttons, or workflows that do not exist in the provided data.
+3. affectedCount can NEVER exceed ${sessionFeedbacks.length}.
 
 Return a JSON array of issue objects.
 `.trim();
 }
 
-export const SUMMARY_SCHEMA = {
-  type: SchemaType.ARRAY,
-  items: {
-    type: SchemaType.OBJECT,
-    properties: {
-      title: { type: SchemaType.STRING },
-      severity: { type: SchemaType.STRING, enum: ['critical', 'high', 'medium', 'low'] },
-      affectedCount: { type: SchemaType.NUMBER },
-      description: { type: SchemaType.STRING },
-      suggestedFix: { type: SchemaType.STRING },
-    },
-    required: ['title', 'severity', 'affectedCount', 'description', 'suggestedFix'],
-  },
+/**
+ * Grounded Post-Check: Drop any hallucinated insights and cap affectedCount.
+ */
+export function filterAndGroundedIssues(issues, sessionFeedbacks, pageAudits, totalSessions, visitedCorpus = '') {
+  const maxSessions = Math.max(1, totalSessions);
+  const corpusLower = visitedCorpus.toLowerCase();
+
+  const valid = [];
+
+  for (const issue of (issues || [])) {
+    if (!issue || !issue.title) continue;
+
+    // Cap affectedCount
+    let affectedCount = Number(issue.affectedCount) || 1;
+    affectedCount = Math.min(maxSessions, Math.max(1, affectedCount));
+
+    const titleLower = issue.title.toLowerCase();
+    const descLower = (issue.description || '').toLowerCase();
+
+    // Check for obvious hallucinated demo-site strings on non-demo sites
+    const demoLeakedPhrases = ['sku acquirement', 'fulfilment matrix', 'requisite email datum'];
+    let leaked = false;
+    for (const phrase of demoLeakedPhrases) {
+      if ((titleLower.includes(phrase) || descLower.includes(phrase)) && !corpusLower.includes(phrase)) {
+        leaked = true;
+        break;
+      }
+    }
+
+    if (leaked) {
+      console.warn(`[llm] Dropping hallucinated issue containing leaked phrase: "${issue.title}"`);
+      continue;
+    }
+
+    valid.push({
+      title: issue.title,
+      severity: ['critical', 'high', 'medium', 'low'].includes(issue.severity) ? issue.severity : 'medium',
+      affectedCount,
+      description: issue.description || '',
+      suggestedFix: issue.suggestedFix || 'Improve visual hierarchy and clarity.',
+    });
+  }
+
+  // If no valid issues remain, generate grounded issues directly from pageAudits
+  if (valid.length === 0 && Array.isArray(pageAudits) && pageAudits.length > 0) {
+    const allFindings = pageAudits.flatMap(a => a.findings || []);
+
+    const fontIssue = allFindings.find(f => f.type === 'font_size');
+    if (fontIssue) {
+      valid.push({
+        title: 'Small and Low-Legibility Text / Action Elements',
+        severity: 'high',
+        affectedCount: Math.min(maxSessions, 2),
+        description: `Elements with font size < 12px detected (${fontIssue.detail}), impairing readability and tap confidence.`,
+        suggestedFix: 'Increase font sizes to a minimum of 14px on all action items and labels.',
+      });
+    }
+
+    const labelIssue = allFindings.find(f => f.type === 'missing_label');
+    if (labelIssue) {
+      valid.push({
+        title: 'Unlabeled Form Controls',
+        severity: 'high',
+        affectedCount: Math.min(maxSessions, 2),
+        description: `Form fields lack visible <label> tags (${labelIssue.detail}), causing uncertainty during input.`,
+        suggestedFix: 'Associate every form input with an explicit <label> element.',
+      });
+    }
+
+    const tapIssue = allFindings.find(f => f.type === 'tap_target');
+    if (tapIssue) {
+      valid.push({
+        title: 'Undersized Tap Targets',
+        severity: 'medium',
+        affectedCount: Math.min(maxSessions, 1),
+        description: `Interactive elements under 44x44px detected (${tapIssue.detail}), leading to misclicks or frustration.`,
+        suggestedFix: 'Enlarge clickable padding to at least 44x44px per WCAG guidelines.',
+      });
+    }
+  }
+
+  return valid.slice(0, 3);
+}
+
+export default {
+  callLLM,
+  buildPageStatePrompt,
+  buildSummaryPrompt,
+  filterAndGroundedIssues,
+  normalizeActionOutput,
+  ACTION_SCHEMA,
+  SUMMARY_SCHEMA,
 };

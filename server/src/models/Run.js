@@ -3,6 +3,12 @@ import crypto from 'crypto';
 
 const RunSchema = new mongoose.Schema(
   {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
     url: {
       type: String,
       required: [true, 'URL is required'],
@@ -70,6 +76,15 @@ const RunSchema = new mongoose.Schema(
       default: Date.now,
     },
     completedAt: {
+      type: Date,
+      default: null,
+    },
+    shareToken: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    shareExpiresAt: {
       type: Date,
       default: null,
     },

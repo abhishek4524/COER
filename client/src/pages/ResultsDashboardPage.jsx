@@ -14,13 +14,10 @@ import SmartImage from '../components/ui/SmartImage';
 import Skeleton from '../components/ui/Skeleton';
 import InteractiveHeatmap from '../components/dashboard/InteractiveHeatmap';
 import { all50Personas } from '../mock/personas';
-import { runMetrics, funnelData, insightsData, allSessions } from '../mock/sessions';
+import OnboardingBanner from '../components/dashboard/OnboardingBanner';
+import { useAuth } from '../context/AuthContext';
 import {
-  getRunMetrics,
-  getFunnelData,
-  getInsights,
-  getSessions,
-  getRunById,
+  getRunReport,
   getRuns,
   getPersonas,
 } from '../services/api';
@@ -259,17 +256,20 @@ const FeedbackCard = ({ session }) => {
 // ─── Main ResultsDashboardPage ─────────────────────────────────────────────
 export const ResultsDashboardPage = () => {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [searchParams] = useSearchParams();
   const queryRunId = searchParams.get('runId');
 
   const [runId, setRunId] = useState(queryRunId || '');
   const [run, setRun] = useState(null);
-  const [metrics, setMetrics] = useState(runMetrics);
-  const [funnel, setFunnel] = useState(funnelData);
-  const [insights, setInsights] = useState(insightsData);
-  const [sessions, setSessions] = useState(allSessions);
+  const [metrics, setMetrics] = useState(null);
+  const [funnel, setFunnel] = useState(null);
+  const [insights, setInsights] = useState(null);
+  const [sessions, setSessions] = useState(null);
+  const [personaTypeScores, setPersonaTypeScores] = useState([]);
   const [personas, setPersonas] = useState(all50Personas);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [animateDone, setAnimateDone] = useState(false);
 
   useEffect(() => {
@@ -277,38 +277,42 @@ export const ResultsDashboardPage = () => {
 
     async function loadData() {
       setLoading(true);
+      setError(null);
       try {
         let activeId = queryRunId;
         if (!activeId) {
           const runs = await getRuns();
           if (runs && runs.length > 0) {
             activeId = runs[0].id || runs[0]._id;
-          } else {
-            activeId = 'run-2024-001';
           }
+        }
+        if (!activeId) {
+          if (isMounted) { setLoading(false); setError('No runs found. Start a run from the New Run page.'); }
+          return;
         }
         setRunId(activeId);
 
-        const [runData, metricsData, funnelDataRes, insightsDataRes, sessionsData, personasDataRes] = await Promise.all([
-          getRunById(activeId),
-          getRunMetrics(activeId),
-          getFunnelData(activeId),
-          getInsights(activeId),
-          getSessions(activeId),
-          getPersonas(),
-        ]);
-
+        // Fetch report as the single source of truth
+        const report = await getRunReport(activeId);
         if (!isMounted) return;
 
-        if (runData) setRun(runData);
-        if (metricsData) setMetrics(metricsData);
-        if (funnelDataRes && funnelDataRes.length > 0) setFunnel(funnelDataRes);
-        if (insightsDataRes && insightsDataRes.length > 0) setInsights(insightsDataRes);
-        if (sessionsData && sessionsData.length > 0) setSessions(sessionsData);
-        if (personasDataRes && personasDataRes.length > 0) setPersonas(personasDataRes);
+        if (report) {
+          setRun(report.run);
+          setMetrics(report.metrics);
+          setFunnel(Array.isArray(report.funnel) ? report.funnel : null);
+          setInsights(Array.isArray(report.insights) ? report.insights : null);
+          setSessions(Array.isArray(report.sessions) ? report.sessions : null);
+          setPersonaTypeScores(report.personaTypeScores || []);
+        }
+
+        const personasDataRes = await getPersonas();
+        if (isMounted && personasDataRes && personasDataRes.length > 0) {
+          setPersonas(personasDataRes);
+        }
 
       } catch (err) {
-        console.warn('[ResultsDashboardPage] Error loading real run data:', err.message);
+        console.error('[ResultsDashboardPage] Error loading run data:', err.message);
+        if (isMounted) setError(err.message);
       } finally {
         if (isMounted) {
           setLoading(false);
@@ -322,20 +326,20 @@ export const ResultsDashboardPage = () => {
     return () => { isMounted = false; };
   }, [queryRunId]);
 
-  // Dynamic persona type scores
-  const personaTypeData = run?.summary?.personaTypeScores?.length > 0
-    ? run.summary.personaTypeScores.map(s => ({
+  // Real persona type scores from report (no hardcoded fallback)
+  const personaTypeData = personaTypeScores?.length > 0
+    ? personaTypeScores.map(s => ({
         label: s.tag,
         success: s.successRate,
         total: s.sessionCount,
       }))
-    : [
-        { label: 'Gen-Z Mobile', success: 20, total: 12 },
-        { label: 'Seniors 55+', success: 10, total: 8 },
-        { label: 'Power Users', success: 80, total: 6 },
-        { label: 'Accessibility', success: 15, total: 5 },
-        { label: 'Casual', success: 40, total: 4 },
-      ];
+    : run?.summary?.personaTypeScores?.length > 0
+      ? run.summary.personaTypeScores.map(s => ({
+          label: s.tag,
+          success: s.successRate,
+          total: s.sessionCount,
+        }))
+      : [];
 
   if (loading) {
     return (
@@ -376,18 +380,63 @@ export const ResultsDashboardPage = () => {
     );
   }
 
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-4">
+        <p className="text-[#F08A7E] font-semibold">{error}</p>
+        <button
+          onClick={() => navigate('/app/new-run')}
+          className="px-4 py-2 bg-[#6C63FF] text-white rounded-xl text-sm font-semibold hover:bg-[#5b52e0] transition-colors"
+        >
+          Start a New Run
+        </button>
+      </div>
+    );
+  }
+
+  // Use real data or fall back to safe empty defaults (never mock)
+  const safeMetrics = metrics || { taskSuccessRate: 0, avgFrustration: 0, ctaMissRate: 0, avgSessionTime: 0, sparklines: { taskSuccess: [], frustration: [], dropOff: [], sessionTime: [] } };
+  const safeSessions = sessions || [];
+  const safeFunnel = funnel || [];
+  const safeInsights = insights || [];
+  const isRunning = run?.status === 'running' || run?.status === 'queued';
+  const isFailed = run?.status === 'failed';
+
   return (
     <div className="flex flex-col gap-6">
+
+      <OnboardingBanner user={user} runCount={safeSessions.length} />
+
+      {/* ── Run status banner ── */}
+      {isRunning && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-[#6C63FF]/10 border border-[#6C63FF]/20 text-[#6C63FF] text-sm font-medium"
+        >
+          <RefreshCw size={16} className="animate-spin shrink-0" />
+          <span>Run is in progress — results will appear when complete. <button onClick={() => navigate(`/app/live?runId=${runId}`)} className="underline ml-1">Watch live →</button></span>
+        </motion.div>
+      )}
+      {isFailed && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-[#F08A7E]/10 border border-[#F08A7E]/20 text-[#F08A7E] text-sm font-medium"
+        >
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>Run failed: {run?.summary?.errorMessage || 'Unknown error'}. <button onClick={() => navigate('/app/new-run')} className="underline ml-1">Start a new run →</button></span>
+        </motion.div>
+      )}
+
       {/* ── Metric cards ── */}
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
-        <MetricCard title="Task Success Rate" value={metrics.taskSuccessRate} suffix="%" delta={+12}
-          sparkData={metrics.sparklines.taskSuccess} color="#8FB8A8" animate={animateDone} />
-        <MetricCard title="Avg Frustration" value={metrics.avgFrustration} unit="" suffix="/100" delta={-8}
-          sparkData={metrics.sparklines.frustration} color="#F08A7E" animate={animateDone} />
-        <MetricCard title="CTA Miss Rate" value={metrics.ctaMissRate} suffix="%" delta={-5}
-          sparkData={metrics.sparklines.dropOff} color="#6C63FF" animate={animateDone} />
-        <MetricCard title="Avg Session" value={metrics.avgSessionTime} suffix="s" delta={+3}
-          sparkData={metrics.sparklines.sessionTime} color="#6B6B70" animate={animateDone} />
+        <MetricCard title="Task Success Rate" value={safeMetrics.taskSuccessRate} suffix="%" delta={+12}
+          sparkData={safeMetrics.sparklines?.taskSuccess || []} color="#8FB8A8" animate={animateDone} />
+        <MetricCard title="Avg Frustration" value={safeMetrics.avgFrustration} unit="" suffix="/100" delta={-8}
+          sparkData={safeMetrics.sparklines?.frustration || []} color="#F08A7E" animate={animateDone} />
+        <MetricCard title="CTA Miss Rate" value={safeMetrics.ctaMissRate} suffix="%" delta={-5}
+          sparkData={safeMetrics.sparklines?.dropOff || []} color="#6C63FF" animate={animateDone} />
+        <MetricCard title="Avg Session" value={safeMetrics.avgSessionTime} suffix="s" delta={+3}
+          sparkData={safeMetrics.sparklines?.sessionTime || []} color="#6B6B70" animate={animateDone} />
       </div>
 
       {/* ── High-Fidelity Interactive Heatmap ── */}
@@ -398,7 +447,7 @@ export const ResultsDashboardPage = () => {
               Multi-Screen Interaction Heatmap
             </h2>
             <p className="text-xs text-[#6B6B70] dark:text-[#98989F] mt-0.5">
-              Aggregated thermal glow, rage clusters, and scroll depth across {sessions.length} testing sessions
+              Aggregated thermal glow, rage clusters, and scroll depth across {safeSessions.length} testing sessions
               {run?.url ? ` on ${run.url}` : ''}
             </p>
           </div>
@@ -407,7 +456,7 @@ export const ResultsDashboardPage = () => {
           </Badge>
         </div>
 
-        <InteractiveHeatmap runId={runId} sessions={sessions} />
+        <InteractiveHeatmap runId={runId} sessions={safeSessions} />
       </Card>
 
       {/* ── AI Insights + Funnel ── */}
@@ -415,19 +464,27 @@ export const ResultsDashboardPage = () => {
         {/* Insights */}
         <Card className="p-5 flex flex-col gap-4">
           <h2 className="font-heading font-semibold text-lg text-[#1C1C1E] dark:text-[#F2F2F7]">AI Insights</h2>
-          {/* 38/50 avatar grid */}
+          {/* Avatar friction count */}
           <div className="bg-[#F7F6F3] dark:bg-[#0F0F12] rounded-xl p-3">
             <p className="text-xs text-[#6B6B70] dark:text-[#98989F] mb-2">
               <span className="text-[#F08A7E] font-bold font-mono-num text-base">
-                {Math.round((sessions.length * (metrics.ctaMissRate || 30)) / 100) || 3}
+                {safeSessions.filter(s => s.outcome !== 'completed' || (s.frustrationScore || 0) > 40).length}
               </span>
-              <span className="text-[#1C1C1E] dark:text-[#F2F2F7] font-bold font-mono-num text-base"> / {sessions.length}</span>
+              <span className="text-[#1C1C1E] dark:text-[#F2F2F7] font-bold font-mono-num text-base"> / {safeSessions.length || '–'}</span>
               {' '}personas encountered primary UX friction
             </p>
-            <AvatarGrid50 personas={personas} highlightCount={Math.min(personas.length, 38)} animate={animateDone} />
+            <AvatarGrid50
+              personas={personas}
+              highlightCount={safeSessions.filter(s => s.outcome !== 'completed' || (s.frustrationScore || 0) > 40).length}
+              animate={animateDone}
+            />
           </div>
           <div className="flex flex-col gap-3">
-            {insights.map(ins => (
+            {safeInsights.length === 0 ? (
+              <p className="text-sm text-[#6B6B70] dark:text-[#98989F] text-center py-6">
+                {isRunning ? 'AI insights will appear when the run completes.' : 'No insights generated yet.'}
+              </p>
+            ) : safeInsights.map(ins => (
               <InsightCard key={ins.id} insight={ins} personas={personas} />
             ))}
           </div>
@@ -438,8 +495,12 @@ export const ResultsDashboardPage = () => {
           <Card className="p-5 flex flex-col gap-3">
             <h2 className="font-heading font-semibold text-lg text-[#1C1C1E] dark:text-[#F2F2F7]">Drop-off Funnel</h2>
             <div className="flex flex-col gap-2.5">
-              {funnel.map((f) => (
-                <FunnelBar key={f.stage} {...f} maxCount={sessions.length || 50} />
+              {safeFunnel.length === 0 ? (
+                <p className="text-sm text-[#6B6B70] dark:text-[#98989F] text-center py-6">
+                  {isRunning ? 'Funnel data will appear when the run completes.' : 'No funnel data yet.'}
+                </p>
+              ) : safeFunnel.map((f) => (
+                <FunnelBar key={f.stage} {...f} maxCount={safeSessions.length || 1} />
               ))}
             </div>
           </Card>
@@ -453,10 +514,10 @@ export const ResultsDashboardPage = () => {
                   <div className="flex-1 h-4 bg-[#ECEAE5] dark:bg-[#26262F] rounded-full overflow-hidden">
                     <motion.div
                       initial={{ width: 0 }}
-                      animate={{ width: `${(success / 100)}%` }}
+                      animate={{ width: `${success}%` }}
                       transition={{ duration: 0.8 }}
                       className="h-full rounded-full"
-                      style={{ width: `${success}%`, background: success > 50 ? '#8FB8A8' : success > 25 ? '#6C63FF' : '#F08A7E' }}
+                      style={{ background: success > 50 ? '#8FB8A8' : success > 25 ? '#6C63FF' : '#F08A7E' }}
                     />
                   </div>
                   <span className="text-xs font-mono-num font-semibold text-[#6B6B70] dark:text-[#98989F] w-8 text-right">{success}%</span>
@@ -470,15 +531,17 @@ export const ResultsDashboardPage = () => {
       {/* ── Feedback masonry wall ── */}
       <Card className="p-5">
         <h2 className="font-heading font-semibold text-lg text-[#1C1C1E] dark:text-[#F2F2F7] mb-4">
-          Persona Feedback ({sessions.length})
+          Persona Feedback ({safeSessions.length})
         </h2>
-        {sessions.length === 0 ? (
+        {safeSessions.length === 0 ? (
           <div className="py-12 text-center text-[#6B6B70] dark:text-[#98989F]">
-            <p className="text-sm">No persona sessions recorded for this run yet.</p>
+            <p className="text-sm">
+              {isRunning ? 'Sessions are running — feedback will appear here when complete.' : 'No persona sessions recorded for this run yet.'}
+            </p>
           </div>
         ) : (
           <div className="columns-1 sm:columns-2 lg:columns-3 xl:columns-4 gap-4">
-            {sessions.slice(0, 24).map(session => (
+            {safeSessions.slice(0, 24).map(session => (
               <FeedbackCard key={session.id} session={session} />
             ))}
           </div>

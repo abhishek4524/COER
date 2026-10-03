@@ -1,7 +1,12 @@
 /**
  * liveSource.js — Real-Time Persona Simulation Stream
- * Connects to the Express Socket.io server per run room,
- * with fallback to MockLiveSource when VITE_USE_MOCK="true" or when offline.
+ * Connects to the Express Socket.io server per run room.
+ * New events for Live Persona Preview:
+ *   frame:thumb  — 1fps thumbnail for each session tile
+ *   frame:full   — 6fps full-quality stream for watched session
+ *   action:planned — before each action (cursor target, thought, bbox)
+ *   action:result  — after each action (urlChanged, domChanged, dead)
+ *   watch:session / unwatch:session — subscribe/unsubscribe to full stream
  */
 
 import { io } from 'socket.io-client';
@@ -59,23 +64,50 @@ class SocketLiveSource {
     if (this._handlers[event]) this._handlers[event](data);
   }
 
+  // ── Public: subscribe to a session's full-quality stream ──
+  watchSession(sessionId) {
+    if (this.socket?.connected) {
+      this.socket.emit('watch:session', { sessionId, runId: this.runId });
+    }
+  }
+
+  // ── Public: unsubscribe from a session's full-quality stream ──
+  unwatchSession(sessionId) {
+    if (this.socket?.connected) {
+      this.socket.emit('unwatch:session', { sessionId });
+    }
+  }
+
   start() {
     try {
       this.socket = io(SERVER_URL, {
         transports: ['websocket', 'polling'],
-        reconnectionAttempts: 5,
+        reconnectionAttempts: 8,
+        reconnectionDelay: 1000,
         timeout: 5000,
+        withCredentials: true,
       });
 
       this.socket.on('connect', () => {
         this._connected = true;
-        console.log(`[SocketLiveSource] Connected to server, joining room run:${this.runId}`);
+        console.log(`[SocketLiveSource] Connected, joining run:${this.runId}`);
         this.socket.emit('join:run', this.runId);
+        this._emit('connected', {});
+      });
+
+      this.socket.on('reconnect', () => {
+        console.log(`[SocketLiveSource] Reconnected, rejoining run:${this.runId}`);
+        this.socket.emit('join:run', this.runId);
+        this._emit('reconnected', {});
       });
 
       this.socket.on('connect_error', (err) => {
-        console.warn('[SocketLiveSource] Connect error, falling back to mock:', err.message);
-        this._startMockFallback();
+        console.warn('[SocketLiveSource] Connect error:', err.message);
+        if (USE_MOCK) {
+          this._startMockFallback();
+        } else {
+          this._emit('error', { message: 'Connection error: ' + err.message });
+        }
       });
 
       // ── Event: run:started ──
@@ -91,10 +123,12 @@ class SocketLiveSource {
           personaId: data.personaId || id,
           name: data.personaName || 'Tester',
           avatar: data.personaAvatar || '/assets/personas/default.png',
-          color: '#6C63FF',
+          color: data.personaColor || '#6C63FF',
           expression: 'neutral',
           frustration: 10,
           currentStepIndex: 0,
+          viewport: data.viewport || { width: 1440, height: 900 },
+          device: data.device || 'desktop',
         };
 
         this._emit('personaUpdate', {
@@ -103,7 +137,7 @@ class SocketLiveSource {
           persona: {
             name: data.personaName || 'Tester',
             avatar: data.personaAvatar || '/assets/personas/default.png',
-            color: '#6C63FF',
+            color: data.personaColor || '#6C63FF',
             status: 'active',
           },
           expression: 'neutral',
@@ -113,28 +147,50 @@ class SocketLiveSource {
           stepIndex: 0,
           isComplete: false,
           status: 'active',
+          viewport: data.viewport,
+          device: data.device,
         });
       });
 
-      // ── Event: step ──
-      this.socket.on('step', (data) => {
-        const id = data.sessionId || data.personaName;
-        const color = '#6C63FF';
-        const isRageClick = data.action === 'rage_click' || (data.frustration >= 70 && data.action === 'click');
+      // ── Event: action:planned (new — before action executes) ──
+      this.socket.on('action:planned', (data) => {
+        const id = data.sessionId;
+        if (!id) return;
 
-        // Emit cursor movement
-        if (data.x != null && data.y != null) {
+        // Emit cursor move with full metadata for overlay
+        this._emit('actionPlanned', {
+          sessionId: id,
+          type: data.type,
+          target: data.target,
+          bbox: data.bbox,
+          point: data.point,
+          viewport: data.viewport,
+          text: data.text,
+          thought: data.thought,
+          emotion: data.emotion,
+          frustration: data.frustration,
+          stepIndex: data.stepIndex,
+          personaName: data.personaName,
+          personaAvatar: data.personaAvatar,
+          personaColor: data.personaColor,
+          url: data.url,
+        });
+
+        // Emit cursor move for backward-compat overlay
+        if (data.point) {
           this._emit('cursorMove', {
             personaId: id,
             name: data.personaName || 'Tester',
-            color,
-            x: data.x,
-            y: data.y,
-            isRageClick,
+            color: data.personaColor || '#6C63FF',
+            x: data.point.x,
+            y: data.point.y,
+            viewport: data.viewport,
+            action: data.type,
+            isRageClick: false,
           });
         }
 
-        // Emit live thought
+        // Emit thought
         if (data.thought) {
           this._emit('thought', {
             personaId: id,
@@ -142,11 +198,47 @@ class SocketLiveSource {
             avatar: data.personaAvatar || '/assets/personas/default.png',
             fallbackAvatar: `https://api.dicebear.com/8.x/thumbs/svg?seed=${id}`,
             text: data.thought,
-            variant: data.frustration > 50 ? 'friction' : 'default',
+            emotion: data.emotion,
+            variant: (data.frustration || 0) > 50 ? 'friction' : 'default',
           });
         }
+      });
 
-        // Emit persona tile update
+      // ── Event: action:result (new — after action executes) ──
+      this.socket.on('action:result', (data) => {
+        this._emit('actionResult', data);
+      });
+
+      // ── Event: frame:thumb (new — 1fps thumbnail for all persona tiles) ──
+      this.socket.on('frame:thumb', (data) => {
+        this._emit('frameThumb', data);
+      });
+
+      // ── Event: frame:full (new — 6fps full stream for watched session) ──
+      this.socket.on('frame:full', (data) => {
+        this._emit('frameFull', data);
+      });
+
+      // ── Event: watch:ack ──
+      this.socket.on('watch:ack', (data) => {
+        this._emit('watchAck', data);
+      });
+
+      // ── Event: step (legacy — keep for backward compat) ──
+      this.socket.on('step', (data) => {
+        const id = data.sessionId || data.personaName;
+        const color = this._sessions[id]?.color || '#6C63FF';
+        const isRageClick = data.action === 'rage_click' || (data.frustration >= 70 && data.action === 'click');
+
+        if (data.url) {
+          this._emit('urlChange', { sessionId: id, url: data.url });
+        }
+
+        if (data.screenshotUrl) {
+          this._emit('step', { ...data });
+        }
+
+        // Update tile state
         this._emit('personaUpdate', {
           sessionId: id,
           personaId: id,
@@ -170,24 +262,6 @@ class SocketLiveSource {
         });
       });
 
-      // ── Event: emotion ──
-      this.socket.on('emotion', (data) => {
-        const id = data.sessionId || data.personaName;
-        this._emit('personaUpdate', {
-          sessionId: id,
-          personaId: id,
-          persona: {
-            name: data.personaName || 'Tester',
-            avatar: data.personaAvatar || '/assets/personas/default.png',
-            color: '#6C63FF',
-            status: 'active',
-          },
-          expression: data.emotion || 'neutral',
-          frustration: data.frustration || 0,
-          isComplete: false,
-        });
-      });
-
       // ── Event: session:finished ──
       this.socket.on('session:finished', (data) => {
         const id = data.sessionId || data.personaName;
@@ -197,6 +271,7 @@ class SocketLiveSource {
           personaId: id,
           persona: {
             name: data.personaName || 'Tester',
+            avatar: data.personaAvatar,
             status: isConverted ? 'converted' : 'abandoned',
           },
           expression: isConverted ? 'happy' : 'frustrated',
@@ -204,13 +279,22 @@ class SocketLiveSource {
           action: isConverted ? 'Goal Completed ✓' : 'Gave Up ✗',
           isComplete: true,
           status: isConverted ? 'converted' : 'abandoned',
+          finalScreenshot: data.screenshotUrl,
+          outcome: data.outcome,
         });
+        this._emit('sessionFinished', data);
       });
 
       // ── Event: run:finished ──
       this.socket.on('run:finished', (data) => {
-        console.log(`[SocketLiveSource] Run ${this.runId} finished:`, data);
+        console.log(`[SocketLiveSource] Run ${this.runId} finished`);
         this._emit('runComplete', { runId: this.runId, summary: data.summary });
+      });
+
+      // ── Event: run:failed ──
+      this.socket.on('run:failed', (data) => {
+        console.error(`[SocketLiveSource] Run ${this.runId} failed:`, data?.error);
+        this._emit('runFailed', { runId: this.runId, error: data?.error });
       });
 
     } catch (err) {
@@ -271,6 +355,9 @@ class MockLiveSource {
     if (this._handlers[event]) this._handlers[event](data);
   }
 
+  watchSession() {}
+  unwatchSession() {}
+
   start() {
     this._interval = setInterval(() => {
       this._tick++;
@@ -282,7 +369,6 @@ class MockLiveSource {
         return;
       }
 
-      // Pick 3-6 random personas to update this tick
       const toUpdate = active
         .sort(() => Math.random() - 0.5)
         .slice(0, Math.min(active.length, rand(3, 6)));
@@ -290,36 +376,47 @@ class MockLiveSource {
       toUpdate.forEach(session => {
         const maxSteps = session.steps.length;
 
-        // Advance step occasionally
         if (this._tick % rand(6, 12) === 0 && session.currentStepIndex < maxSteps - 1) {
           session.currentStepIndex++;
         }
 
         const currentStep = session.steps[session.currentStepIndex] ?? session.steps[0];
 
-        // Move cursor
         session.cursorX = Math.max(10, Math.min(760, session.cursorX + rand(-40, 40)));
         session.cursorY = Math.max(10, Math.min(480, session.cursorY + rand(-30, 30)));
 
-        // Update frustration
         const isStuck = session.persona.status !== 'converted';
-        session.frustration = Math.min(
-          100,
-          session.frustration + (isStuck ? rand(0, 4) : rand(-1, 1))
-        );
+        session.frustration = Math.min(100, session.frustration + (isStuck ? rand(0, 4) : rand(-1, 1)));
 
-        // Update expression
         if (session.frustration > 80) session.expression = pick(['angry', 'frustrated']);
         else if (session.frustration > 55) session.expression = pick(['confused', 'frustrated']);
         else if (session.persona.status === 'converted') session.expression = pick(['focused', 'happy', 'neutral']);
         else session.expression = pick(['neutral', 'confused']);
 
-        // Check if done
         if (session.currentStepIndex >= maxSteps - 1 && this._tick % rand(20, 30) === 0) {
           session.isComplete = true;
         }
 
         const isRageClick = session.frustration > 70 && Math.random() < 0.15;
+        const actionType = pick(['click', 'scroll', 'type', 'wait']);
+
+        this._emit('actionPlanned', {
+          sessionId: session.id,
+          type: actionType,
+          target: pick(['button', 'link', 'input', 'nav']),
+          bbox: { x: session.cursorX - 20, y: session.cursorY - 10, w: 80, h: 32 },
+          point: { x: session.cursorX, y: session.cursorY },
+          viewport: { w: 1440, h: 900 },
+          text: actionType === 'type' ? 'test input' : null,
+          thought: pick(thoughts),
+          emotion: session.expression,
+          frustration: session.frustration,
+          stepIndex: session.currentStepIndex,
+          personaName: session.persona.name,
+          personaAvatar: session.persona.avatar,
+          personaColor: session.persona.color,
+          url: 'https://example.com',
+        });
 
         this._emit('personaUpdate', {
           sessionId: session.id,

@@ -1,22 +1,17 @@
 /**
  * server/src/workers/agent.js
  *
- * Persona agent loop: Playwright + LLM.
- *
- * runPersonaSession(job, io) is called by BullMQ for each persona session.
- * job.data = { runId, sessionId, personaId, goal, url, device, viewportConfig }
- *
- * The loop:
- *   1. Launch Playwright chromium with persona viewport + optional network throttling
- *   2. Loop max 15 steps:
- *      a. Extract simplified page state
- *      b. Call LLM → JSON action
- *      c. Execute action in Playwright
- *      d. Take screenshot, save Step, emit socket event
- *      e. Break on goal_complete / give_up / max steps
- *   3. Ask persona for final feedback review
- *   4. Run aggregator friction detection
- *   5. Update Session + Run docs
+ * Robust Persona Agent Loop with Playwright + LLM:
+ * - CDP screencast per session (thumbnail 1fps room-wide, full 6fps to watchers)
+ * - action:planned + action:result rich events for Live Preview overlay
+ * - Realistic curved mouse movement before clicks
+ * - Element-index based action execution (no CSS selector hallucination)
+ * - Real bounding-box center click detection (NO fallback to viewport center)
+ * - Dead click detection, SPA network idle, hydration wait
+ * - Loop detection and action repetition prevention
+ * - Automated page audit (axe-core, font size, tap targets, labels)
+ * - Grounded insights post-check
+ * - Strict 120s per-session timeout and guaranteed run lifecycle finalization
  */
 
 import fs from 'fs';
@@ -26,243 +21,265 @@ import Session from '../models/Session.js';
 import Step from '../models/Step.js';
 import Run from '../models/Run.js';
 import Persona from '../models/Persona.js';
-import { callLLM, buildPageStatePrompt, buildSummaryPrompt, SUMMARY_SCHEMA } from '../services/llm.js';
-import { detectFriction } from '../services/aggregator.js';
+import {
+  callLLM,
+  buildPageStatePrompt,
+  buildSummaryPrompt,
+  filterAndGroundedIssues,
+  normalizeActionOutput,
+  SUMMARY_SCHEMA,
+} from '../services/llm.js';
+import {
+  detectFriction,
+  buildRunMetrics,
+  buildPerPersonaTypeScores,
+  buildDropOffFunnel,
+  detectPrimaryCTA,
+} from '../services/aggregator.js';
+import { runPageAudit } from '../services/pageAudit.js';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants & Setup ────────────────────────────────────────────────────────
 
 const MAX_STEPS = 15;
-const ACTION_TIMEOUT_MS = 2500; // fast timeout per element locator attempt
-const PAGE_LOAD_TIMEOUT = 10_000;
+const ACTION_TIMEOUT_MS = 2500;
+const SESSION_TIMEOUT_MS = 120_000;
 const SCREENSHOT_DIR = path.resolve('screenshots');
 
-// Ensure screenshot dir exists
-if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-
-// ─── Viewport configs ────────────────────────────────────────────────────────
+if (!fs.existsSync(SCREENSHOT_DIR)) {
+  fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+}
 
 const VIEWPORTS = {
-  desktop:  { width: 1440, height: 900 },
-  mobile:   { width: 390, height: 844 },
-  slow:     { width: 390, height: 844 },  // mobile + throttling
+  desktop: { width: 1440, height: 900 },
+  mobile:  { width: 390, height: 844 },
+  slow:    { width: 390, height: 844 },
 };
 
-// Chrome DevTools Protocol network conditions for "Slow 3G"
 const SLOW_NETWORK = {
   offline: false,
-  downloadThroughput: (500 * 1024) / 8,   // 500 Kbps
+  downloadThroughput: (500 * 1024) / 8,
   uploadThroughput:   (500 * 1024) / 8,
   latency: 400,
 };
 
-// ─── Page state extraction ────────────────────────────────────────────────────
+// Screencast config (tunable)
+const THUMB_QUALITY = 40;     // jpeg quality for thumbnails
+const THUMB_MAX_WIDTH = 320;
+const FULL_QUALITY = 55;      // jpeg quality for full stream
+const FULL_MAX_WIDTH = 960;
+const THUMB_EVERY_N = 8;      // ~1fps at typical Playwright frame rate
+const FULL_EVERY_N = 1;       // ~6fps for full stream
+
+// ─── Shared Browser Instance ──────────────────────────────────────────────────
+
+let _sharedBrowser = null;
+
+async function getSharedBrowser() {
+  if (!_sharedBrowser || !_sharedBrowser.isConnected()) {
+    _sharedBrowser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+    });
+  }
+  return _sharedBrowser;
+}
+
+// ─── Page State & Element Extraction ─────────────────────────────────────────
 
 async function extractPageState(page) {
+  await page.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => {});
+  await page.waitForTimeout(400);
+
   const url = page.url();
   const title = await page.title().catch(() => '');
 
-  // Visible text (first 1000 chars)
   const visibleText = await page.evaluate(() => {
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const chunks = [];
     let node;
     while ((node = walker.nextNode())) {
       const text = node.textContent?.trim();
-      if (text && text.length > 1) chunks.push(text);
-      if (chunks.join(' ').length > 1000) break;
+      if (text && text.length > 2) {
+        const parent = node.parentElement;
+        if (!['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(parent?.tagName)) {
+          chunks.push(text);
+        }
+      }
     }
-    return chunks.join(' ');
+    return chunks.slice(0, 120).join(' ');
   }).catch(() => '');
 
-  // Interactive elements
+  // 3. Extract visible interactive elements & tag with data-vibetest-idx
   const elements = await page.evaluate(() => {
-    const interactiveRoles = ['button', 'link', 'textbox', 'checkbox', 'radio',
-      'combobox', 'listbox', 'menuitem', 'tab', 'switch'];
-    const interactiveTags = ['a', 'button', 'input', 'select', 'textarea', 'label'];
+    // Clean old indices first
+    document.querySelectorAll('[data-vibetest-idx]').forEach((el) => {
+      el.removeAttribute('data-vibetest-idx');
+    });
 
-    const seen = new Set();
+    const selector = [
+      'a[href]', 'button', 'input', 'select', 'textarea',
+      '[role="button"]', '[role="link"]', '[role="checkbox"]',
+      '[role="radio"]', '[role="combobox"]', '[role="tab"]',
+      '[role="menuitem"]', '[tabindex="0"]',
+    ].join(',');
+
+    const found = document.querySelectorAll(selector);
     const results = [];
+    let idx = 1;
 
-    function process(el) {
+    found.forEach((el) => {
       const rect = el.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return; // invisible
+      if (rect.width <= 2 || rect.height <= 2) return;
       const style = window.getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
 
-      // Build a unique key
-      const key = `${el.tagName}|${rect.x.toFixed(0)}|${rect.y.toFixed(0)}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-
-      const role = el.getAttribute('role')
-        || (el.tagName === 'A' ? 'link'
-          : el.tagName === 'BUTTON' ? 'button'
-          : el.tagName === 'INPUT' ? (el.type || 'textbox')
-          : el.tagName === 'SELECT' ? 'combobox'
-          : el.tagName === 'TEXTAREA' ? 'textbox'
-          : el.tagName.toLowerCase());
-
-      const name = el.getAttribute('aria-label')
-        || el.getAttribute('placeholder')
-        || el.getAttribute('title')
-        || el.textContent?.trim().slice(0, 60)
-        || el.getAttribute('name')
-        || '';
-
-      // Build a reliable selector
-      let selector = '';
-      if (el.id) selector = `#${el.id}`;
-      else if (el.getAttribute('data-testid')) selector = `[data-testid="${el.getAttribute('data-testid')}"]`;
-      else if (el.getAttribute('name')) selector = `[name="${el.getAttribute('name')}"]`;
-      else if (el.className) selector = `.${el.className.trim().split(/\s+/)[0]}`;
-      else selector = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || el.tagName.toLowerCase();
+      const name = (
+        el.getAttribute('aria-label') ||
+        el.getAttribute('placeholder') ||
+        el.getAttribute('title') ||
+        el.textContent?.trim().slice(0, 70) ||
+        el.getAttribute('name') ||
+        el.getAttribute('value') ||
+        ''
+      ).replace(/\s+/g, ' ').trim();
 
       const fontSize = parseFloat(style.fontSize) || 16;
 
+      el.setAttribute('data-vibetest-idx', String(idx));
+
       results.push({
+        index: idx,
+        tag: el.tagName.toLowerCase(),
         role,
-        name: name.trim(),
-        selector,
+        name,
+        fontSize: Math.round(fontSize),
         bbox: {
           x: Math.round(rect.x),
           y: Math.round(rect.y),
           w: Math.round(rect.width),
           h: Math.round(rect.height),
         },
-        fontSize: Math.round(fontSize),
-        tag: el.tagName.toLowerCase(),
       });
-    }
 
-    // Query both by tag and ARIA role
-    interactiveTags.forEach((tag) =>
-      document.querySelectorAll(tag).forEach(process)
-    );
-    interactiveRoles.forEach((role) =>
-      document.querySelectorAll(`[role="${role}"]`).forEach(process)
-    );
+      idx++;
+    });
 
-    return results.slice(0, 50); // cap
+    return results.slice(0, 35);
   }).catch(() => []);
 
-  return { url, title, visibleText, elements };
+  const domSnapshot = await page.evaluate(() => {
+    return document.body ? document.body.innerText.slice(0, 400) : '';
+  }).catch(() => '');
+
+  return { url, title, visibleText, elements, domSnapshot };
 }
 
-// ─── Action execution ─────────────────────────────────────────────────────────
+// ─── Realistic Mouse Movement ────────────────────────────────────────────────
 
-async function executeAction(page, action) {
-  const { action: type, target, text } = action;
-  let x = null, y = null, domChanged = false;
+async function moveMouseNaturally(page, toX, toY, techSavviness = 5) {
+  // Get current mouse position via CDP or default to center
+  const vp = page.viewportSize() || { width: 1440, height: 900 };
+  const fromX = vp.width / 2;
+  const fromY = vp.height / 2;
 
+  const steps = 12;
+  // Slight S-curve via a control point offset
+  const cpX = (fromX + toX) / 2 + (Math.random() - 0.5) * 60;
+  const cpY = (fromY + toY) / 2 + (Math.random() - 0.5) * 40;
+
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    // Quadratic Bezier
+    const x = Math.round((1 - t) * (1 - t) * fromX + 2 * (1 - t) * t * cpX + t * t * toX);
+    const y = Math.round((1 - t) * (1 - t) * fromY + 2 * (1 - t) * t * cpY + t * t * toY);
+    await page.mouse.move(x, y);
+    // Slower movement for less tech-savvy users
+    const delay = Math.max(8, Math.round((10 - techSavviness) * 5 + Math.random() * 10));
+    await page.waitForTimeout(delay);
+  }
+}
+
+// ─── Action Execution ────────────────────────────────────────────────────────
+
+async function executeAction(page, actionObj, elements = [], techSavviness = 5) {
+  const { action: type, elementIndex, text } = actionObj;
+  let x = null;
+  let y = null;
+  let clicked = false;
+  let domChanged = false;
   const urlBefore = page.url();
+  const snapshotBefore = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 400) : '').catch(() => '');
 
   switch (type) {
     case 'click': {
-      let clicked = false;
-      if (target) {
-        // Strategy 1: Direct CSS selector
+      if (elementIndex != null) {
         try {
-          const el = page.locator(target).first();
-          const box = await el.boundingBox({ timeout: 1200 });
-          if (box) {
+          const locator = page.locator(`[data-vibetest-idx="${elementIndex}"]`).first();
+          await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          const box = await locator.boundingBox({ timeout: 1500 });
+
+          if (box && box.width > 0 && box.height > 0) {
             x = Math.round(box.x + box.width / 2);
             y = Math.round(box.y + box.height / 2);
-            await el.click({ timeout: ACTION_TIMEOUT_MS });
+            // Move mouse naturally before clicking
+            await moveMouseNaturally(page, x, y, techSavviness);
+            await locator.click({ timeout: ACTION_TIMEOUT_MS });
             clicked = true;
           }
-        } catch {}
-
-        // Strategy 2: Button by name/label
-        if (!clicked) {
-          try {
-            const el = page.getByRole('button', { name: target, exact: false }).first();
-            const box = await el.boundingBox({ timeout: 1200 });
-            if (box) {
-              x = Math.round(box.x + box.width / 2);
-              y = Math.round(box.y + box.height / 2);
-            }
-            await el.click({ timeout: ACTION_TIMEOUT_MS });
-            clicked = true;
-          } catch {}
-        }
-
-        // Strategy 3: Link by name/label
-        if (!clicked) {
-          try {
-            const el = page.getByRole('link', { name: target, exact: false }).first();
-            const box = await el.boundingBox({ timeout: 1200 });
-            if (box) {
-              x = Math.round(box.x + box.width / 2);
-              y = Math.round(box.y + box.height / 2);
-            }
-            await el.click({ timeout: ACTION_TIMEOUT_MS });
-            clicked = true;
-          } catch {}
-        }
-
-        // Strategy 4: Exact or partial text match
-        if (!clicked) {
-          try {
-            const el = page.getByText(target, { exact: false }).first();
-            const box = await el.boundingBox({ timeout: 1200 });
-            if (box) {
-              x = Math.round(box.x + box.width / 2);
-              y = Math.round(box.y + box.height / 2);
-            }
-            await el.click({ timeout: ACTION_TIMEOUT_MS });
-            clicked = true;
-          } catch {}
-        }
-
-        // Strategy 5: If nothing matched, click fallback coordinates or center of viewport
-        if (!clicked && x == null) {
-          x = 640;
-          y = 360;
-          await page.mouse.click(x, y).catch(() => {});
+        } catch (clickErr) {
+          console.warn(`[agent] Click on element [${elementIndex}] failed:`, clickErr.message);
         }
       }
-      domChanged = page.url() !== urlBefore;
+
+      if (!clicked) {
+        return {
+          actionExecuted: 'failed_action',
+          x: null,
+          y: null,
+          domChanged: false,
+          isDeadClick: false,
+          urlAfter: page.url(),
+        };
+      }
       break;
     }
 
     case 'type': {
-      if (target) {
-        let typed = false;
+      if (elementIndex != null) {
         try {
-          const el = page.locator(target).first();
-          await el.click({ timeout: 1200 });
-          await el.fill(text || '', { timeout: ACTION_TIMEOUT_MS });
-          typed = true;
-        } catch {}
-
-        if (!typed) {
-          try {
-            const el = page.getByPlaceholder(target, { exact: false }).first();
-            await el.click({ timeout: 1200 });
-            await el.fill(text || '', { timeout: ACTION_TIMEOUT_MS });
-            typed = true;
-          } catch {}
+          const locator = page.locator(`[data-vibetest-idx="${elementIndex}"]`).first();
+          await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          const box = await locator.boundingBox({ timeout: 1500 }).catch(() => null);
+          if (box) {
+            x = Math.round(box.x + box.width / 2);
+            y = Math.round(box.y + box.height / 2);
+            await moveMouseNaturally(page, x, y, techSavviness);
+          }
+          await locator.click({ timeout: 1200 }).catch(() => {});
+          await locator.fill(text || '', { timeout: ACTION_TIMEOUT_MS });
+          domChanged = true;
+        } catch (typeErr) {
+          console.warn(`[agent] Fill on element [${elementIndex}] failed:`, typeErr.message);
         }
-
-        if (!typed) {
-          try {
-            await page.keyboard.type(text || '');
-            typed = true;
-          } catch {}
-        }
-        domChanged = typed;
       }
       break;
     }
 
     case 'scroll': {
-      await page.evaluate(() => window.scrollBy(0, 400));
-      await page.waitForTimeout(200);
+      await page.evaluate(() => window.scrollBy({ top: 450, behavior: 'smooth' }));
+      await page.waitForTimeout(400);
+      domChanged = true;
       break;
     }
 
     case 'wait': {
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(800);
       break;
     }
 
@@ -274,27 +291,127 @@ async function executeAction(page, action) {
       console.warn(`[agent] Unknown action: ${type}`);
   }
 
-  // Wait briefly for DOM or navigation settlement
-  await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const urlAfter = page.url();
+  const snapshotAfter = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 400) : '').catch(() => '');
 
-  return { x, y, domChanged, urlAfter: page.url() };
+  if (urlAfter !== urlBefore || snapshotAfter !== snapshotBefore) {
+    domChanged = true;
+  }
+
+  const isDeadClick = clicked && !domChanged && urlAfter === urlBefore;
+
+  return {
+    actionExecuted: type,
+    x,
+    y,
+    domChanged,
+    isDeadClick,
+    urlAfter,
+  };
 }
 
 // ─── Screenshot helper ────────────────────────────────────────────────────────
+
+const SERVER_PORT = process.env.PORT || 5000;
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://localhost:${SERVER_PORT}`;
 
 async function takeScreenshot(page, runId, stepIndex) {
   const filename = `${runId}_step${stepIndex}_${Date.now()}.png`;
   const filePath = path.join(SCREENSHOT_DIR, filename);
   await page.screenshot({ path: filePath, type: 'png', fullPage: false }).catch(() => {});
-  return `/screenshots/${filename}`;
+  return `${SERVER_BASE_URL}/screenshots/${filename}`;
 }
 
-// ─── Main persona session runner ──────────────────────────────────────────────
+// ─── CDP Screencast Helper ────────────────────────────────────────────────────
 
-export async function runPersonaSession(job, io) {
-  const { runId, sessionId, personaId, goal, url, device } = job.data;
+async function startScreencast(page, sessionId, runId, io) {
+  let cdp = null;
+  let thumbFrameCount = 0;
+  let fullFrameCount = 0;
+  let stopped = false;
 
-  console.log(`[agent] Starting session ${sessionId} | persona ${personaId} | run ${runId}`);
+  try {
+    cdp = await page.context().newCDPSession(page);
+  } catch (err) {
+    console.warn(`[screencast:${sessionId}] Could not create CDP session:`, err.message);
+    return () => {}; // return no-op stopper
+  }
+
+  const handleFrame = async (event) => {
+    if (stopped) return;
+    try {
+      // Always ack the frame to keep stream flowing
+      await cdp.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => {});
+    } catch {}
+
+    if (!io) return;
+
+    thumbFrameCount++;
+    // Thumbnail: every Nth frame → ~1fps → emit to whole run room
+    if (thumbFrameCount % THUMB_EVERY_N === 0) {
+      io.to(`run:${runId}`).emit('frame:thumb', {
+        sessionId,
+        jpegBase64: event.data,
+        ts: event.metadata?.timestamp || Date.now(),
+      });
+    }
+
+    // Full quality: only for watching sockets → check watcher set
+    const watchers = io._sessionWatchers?.get(sessionId);
+    if (watchers && watchers.size > 0) {
+      fullFrameCount++;
+      if (fullFrameCount % FULL_EVERY_N === 0) {
+        // Only emit to watchers (by socket id)
+        for (const socketId of watchers) {
+          const sock = io.sockets.sockets.get(socketId);
+          if (sock && !sock.disconnected) {
+            // Skip if socket is backpressured
+            if (sock.conn?.transport?.writable !== false) {
+              sock.emit('frame:full', {
+                sessionId,
+                jpegBase64: event.data,
+                ts: event.metadata?.timestamp || Date.now(),
+              });
+            }
+          }
+        }
+      }
+    }
+  };
+
+  try {
+    await cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: FULL_QUALITY, // full quality, we'll use thumbs for room
+      maxWidth: FULL_MAX_WIDTH,
+      maxHeight: 720,
+      everyNthFrame: 2,
+    });
+    cdp.on('Page.screencastFrame', handleFrame);
+    console.log(`[screencast:${sessionId}] Started`);
+  } catch (err) {
+    console.warn(`[screencast:${sessionId}] Failed to start:`, err.message);
+    return () => {};
+  }
+
+  // Return stopper function
+  return async () => {
+    if (stopped) return;
+    stopped = true;
+    try {
+      cdp.off('Page.screencastFrame', handleFrame);
+      await cdp.send('Page.stopScreencast').catch(() => {});
+      await cdp.detach().catch(() => {});
+      console.log(`[screencast:${sessionId}] Stopped`);
+    } catch {}
+  };
+}
+
+// ─── Single Persona Session Runner ────────────────────────────────────────────
+
+export async function runPersonaSession(data, io, sharedBrowser) {
+  const { runId, sessionId, personaId, goal, url, device } = data;
 
   const persona = await Persona.findById(personaId);
   if (!persona) throw new Error(`Persona ${personaId} not found`);
@@ -304,17 +421,9 @@ export async function runPersonaSession(job, io) {
 
   const viewport = VIEWPORTS[device] || VIEWPORTS.desktop;
   const isMobile = device === 'mobile' || device === 'slow';
+  const techSavviness = persona.traits?.techSavviness ?? 5;
 
-  // ── Launch browser ──────────────────────────────────────────────────────────
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-    ],
-  });
-
+  const browser = sharedBrowser || await getSharedBrowser();
   const context = await browser.newContext({
     viewport,
     userAgent: isMobile
@@ -324,7 +433,6 @@ export async function runPersonaSession(job, io) {
     ignoreHTTPSErrors: true,
   });
 
-  // Apply network throttling for slow-network device
   if (device === 'slow') {
     const cdp = await context.newCDPSession(await context.newPage());
     await cdp.send('Network.emulateNetworkConditions', SLOW_NETWORK);
@@ -334,210 +442,367 @@ export async function runPersonaSession(job, io) {
   const page = await context.newPage();
   page.setDefaultTimeout(ACTION_TIMEOUT_MS);
 
+  // Emit session:started with viewport info
+  if (io) {
+    io.to(`run:${runId}`).emit('session:started', {
+      sessionId,
+      personaName: persona.name,
+      personaAvatar: persona.avatarSet?.default || persona.avatar,
+      personaColor: persona.color || '#6C63FF',
+      viewport,
+      device,
+    });
+  }
+
+  // Start CDP screencast
+  const stopScreencast = await startScreencast(page, sessionId.toString(), runId, io);
+
   const stepHistory = [];
+  const visitedUrls = [];
+  const pageAudits = [];
+  const auditedUrls = new Set();
+
   let stepIndex = 0;
   let outcome = 'in_progress';
   let clickCount = 0;
   let rageClickCount = 0;
+  let primaryCTAClicked = false;
+  let detectedPrimaryCTAElement = null;
   const startTime = Date.now();
+  let navStart = Date.now();
 
   const targetUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
 
   try {
-    // Navigate to URL (gracefully handle slow or heavy real sites)
+    let navSuccess = false;
+    navStart = Date.now();
+
     try {
-      await page.goto(targetUrl, { waitUntil: 'commit', timeout: 20_000 });
-      await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      const currentUrl = page.url();
+      if (!currentUrl.startsWith('chrome-error://')) {
+        navSuccess = true;
+      }
     } catch (navErr) {
-      console.warn(`[agent] Navigation notice for ${targetUrl}:`, navErr.message);
+      console.warn(`[agent] Navigation failed for ${targetUrl}:`, navErr.message);
     }
 
-    // ── Step loop ────────────────────────────────────────────────────────────
+    if (!navSuccess || page.url().startsWith('chrome-error://')) {
+      console.warn(`[agent] Site unreachable: ${targetUrl}`);
+      outcome = 'failed';
+      const duration = Math.round((Date.now() - startTime) / 1000);
+
+      await Session.findByIdAndUpdate(sessionId, {
+        outcome: 'failed',
+        totalTime: duration,
+        frustrationScore: 0,
+        finalFeedback: 'Could not reach the site: connection refused or domain unreachable.',
+      });
+
+      if (io) {
+        io.to(`run:${runId}`).emit('session:finished', {
+          sessionId,
+          personaName: persona.name,
+          outcome: 'failed',
+          frustrationScore: 0,
+          finalFeedback: 'Could not reach the site.',
+        });
+      }
+
+      await stopScreencast();
+      await context.close().catch(() => {});
+      return {
+        sessionId,
+        personaName: persona.name,
+        outcome: 'failed',
+        error: 'site unreachable',
+        totalTime: duration,
+        pageAudits: [],
+      };
+    }
+
+    visitedUrls.push(page.url());
+
+    let lastActionResult = 'Navigated to landing page.';
+    let lastChosenElementIndex = null;
+    let consecutiveUnchangedActions = 0;
+
     while (stepIndex < MAX_STEPS) {
-      // a. Extract page state
+      if (Date.now() - startTime > SESSION_TIMEOUT_MS) {
+        console.warn(`[agent] Session ${sessionId} exceeded 120s timeout.`);
+        outcome = 'gave_up';
+        break;
+      }
+
+      // a. Extract page state & elements
       const pageState = await extractPageState(page);
-      pageState.url = page.url();
 
-      // b. Build prompt + call LLM
-      const last5 = stepHistory.slice(-5);
-      const userPrompt = buildPageStatePrompt(pageState, persona, goal, last5);
+      if (!detectedPrimaryCTAElement && pageState.elements.length > 0) {
+        detectedPrimaryCTAElement = detectPrimaryCTA(pageState.elements);
+      }
 
-      let llmAction;
+      if (!auditedUrls.has(pageState.url)) {
+        auditedUrls.add(pageState.url);
+        const audit = await runPageAudit(page, pageState.url, Date.now() - navStart);
+        pageAudits.push(audit);
+      }
+
+      // Check for navigation backtracking loop
+      const uLen = visitedUrls.length;
+      if (uLen >= 6) {
+        const u1 = visitedUrls[uLen - 1];
+        const u2 = visitedUrls[uLen - 2];
+        if (u1 !== u2 &&
+            visitedUrls[uLen - 3] === u1 && visitedUrls[uLen - 4] === u2 &&
+            visitedUrls[uLen - 5] === u1 && visitedUrls[uLen - 6] === u2) {
+          console.warn(`[agent] Navigation loop detected for ${persona.name}. Forcing give_up.`);
+          outcome = 'gave_up';
+          break;
+        }
+      }
+
+      // b. Build prompt + Call LLM
+      const repeatWarning = consecutiveUnchangedActions >= 1
+        ? `Your previous action on element #${lastChosenElementIndex} had NO effect. You MUST choose a different element or action.`
+        : null;
+
+      const userPrompt = buildPageStatePrompt(
+        pageState,
+        persona,
+        goal,
+        stepHistory.slice(-5),
+        {
+          lastActionResult,
+          recentVisitedUrls: visitedUrls.slice(-4),
+          repeatWarning,
+        }
+      );
+
+      let rawLLMAction;
       try {
-        llmAction = await callLLM(persona.systemPrompt, userPrompt);
-      } catch (llmErr) {
-        console.error(`[agent] LLM error on step ${stepIndex}:`, llmErr.message);
-        llmAction = {
-          action: 'give_up',
-          target: null,
-          text: null,
-          thought: 'I am confused and cannot proceed.',
-          emotion: 'frustrated',
-          frustration: 8,
+        rawLLMAction = await callLLM(persona.systemPrompt, userPrompt);
+      } catch (err) {
+        console.warn(`[agent] LLM call error step ${stepIndex}:`, err.message);
+        rawLLMAction = {
+          action: 'wait',
+          thought: 'Waiting for the interface to respond.',
+          emotion: 'neutral',
+          frustration: 2,
         };
       }
 
-      // Validate required fields
-      if (!llmAction.action) llmAction.action = 'wait';
-      llmAction.frustration = Math.min(10, Math.max(0, Number(llmAction.frustration) || 0));
+      const decision = normalizeActionOutput(rawLLMAction, pageState.elements);
 
-      // c. Execute action + take screenshot
-      const { x, y, domChanged, urlAfter } = await executeAction(page, llmAction).catch((err) => {
-        console.warn(`[agent] Execute error step ${stepIndex}:`, err.message);
-        return { x: null, y: null, domChanged: false, urlAfter: page.url() };
-      });
+      if (decision.action === 'click' && decision.elementIndex != null && decision.elementIndex === lastChosenElementIndex && consecutiveUnchangedActions >= 1) {
+        decision.action = 'scroll';
+        decision.thought = 'Clicking that element had no effect. Scrolling to explore alternatives.';
+      }
 
+      if (detectedPrimaryCTAElement && decision.elementIndex === detectedPrimaryCTAElement.index) {
+        primaryCTAClicked = true;
+      }
+
+      // Get target element bbox for planned event
+      const targetElement = pageState.elements.find(e => e.index === decision.elementIndex);
+      const targetLabel = targetElement ? `${targetElement.name || targetElement.tag} [${decision.elementIndex}]` : 'window';
+      const targetBbox = targetElement?.bbox || null;
+      const targetPoint = targetBbox ? {
+        x: targetBbox.x + Math.round(targetBbox.w / 2),
+        y: targetBbox.y + Math.round(targetBbox.h / 2),
+      } : null;
+
+      // c. Emit action:planned BEFORE executing
+      if (io) {
+        io.to(`run:${runId}`).emit('action:planned', {
+          sessionId,
+          type: decision.action,
+          target: targetLabel,
+          bbox: targetBbox,
+          point: targetPoint,
+          viewport,
+          text: decision.text || null,
+          thought: decision.thought,
+          emotion: decision.emotion || 'neutral',
+          frustration: Math.min(100, Math.max(0, (decision.frustration || 0) * 10)),
+          stepIndex,
+          personaName: persona.name,
+          personaAvatar: persona.avatarSet?.default || persona.avatar,
+          personaColor: persona.color || '#6C63FF',
+          url: pageState.url,
+        });
+      }
+
+      // d. Execute action
+      const execResult = await executeAction(page, decision, pageState.elements, techSavviness);
       const screenshotUrl = await takeScreenshot(page, runId, stepIndex);
 
-      // Track click counts
-      if (llmAction.action === 'click') clickCount++;
+      if (execResult.domChanged || execResult.urlAfter !== pageState.url) {
+        consecutiveUnchangedActions = 0;
+        lastActionResult = execResult.urlAfter !== pageState.url
+          ? `Navigated to ${execResult.urlAfter}`
+          : 'DOM updated successfully.';
+        if (!visitedUrls.includes(execResult.urlAfter)) {
+          visitedUrls.push(execResult.urlAfter);
+        }
+      } else {
+        consecutiveUnchangedActions++;
+        lastActionResult = 'Nothing happened (no DOM or URL change).';
+      }
 
-      // Check if it was a rage-click (frustration ≥ 7 + click)
-      const isRageClick = llmAction.action === 'click' && llmAction.frustration >= 7;
+      lastChosenElementIndex = decision.elementIndex;
+
+      const isRealClick = execResult.actionExecuted === 'click' && execResult.x != null;
+      if (isRealClick) clickCount++;
+
+      const isRageClick = isRealClick && decision.frustration >= 7;
       if (isRageClick) rageClickCount++;
 
-      // d. Save Step to DB
-      const step = await Step.create({
+      const stepFrustration = Math.min(100, Math.max(0, decision.frustration * 10));
+
+      // e. Emit action:result AFTER executing
+      if (io) {
+        io.to(`run:${runId}`).emit('action:result', {
+          sessionId,
+          urlChanged: execResult.urlAfter !== pageState.url,
+          newUrl: execResult.urlAfter,
+          domChanged: execResult.domChanged,
+          dead: execResult.isDeadClick,
+          isRageClick,
+          stepIndex,
+        });
+      }
+
+      // f. Save Step
+      await Step.create({
         sessionId,
         runId,
         stepIndex,
-        action: isRageClick ? 'rage_click' : llmAction.action,
-        target: llmAction.target,
-        x,
-        y,
+        action: isRageClick ? 'rage_click' : execResult.actionExecuted,
+        target: targetLabel,
+        x: execResult.x,
+        y: execResult.y,
         viewport,
-        thought: llmAction.thought,
-        emotion: llmAction.emotion,
-        frustration: llmAction.frustration * 10, // normalize to 0-100 for DB
+        thought: decision.thought,
+        emotion: decision.emotion,
+        frustration: stepFrustration,
         screenshotUrl,
-        isDeadClick: llmAction.action === 'click' && !domChanged && urlAfter === pageState.url,
-        domChanged,
+        isDeadClick: execResult.isDeadClick,
+        domChanged: execResult.domChanged,
         url: pageState.url,
         pageTitle: pageState.title,
         personaName: persona.name,
         ts: new Date(),
-      }).catch((err) => {
-        console.error('[agent] Step save error:', err.message);
-        return null;
-      });
+      }).catch((e) => console.error('[agent] Step save error:', e.message));
 
-      // Push to history for LLM context
       stepHistory.push({
-        action: llmAction.action,
-        target: llmAction.target,
-        thought: llmAction.thought,
-        emotion: llmAction.emotion,
-        frustration: llmAction.frustration,
+        action: execResult.actionExecuted,
+        elementIndex: decision.elementIndex,
+        target: targetLabel,
+        thought: decision.thought,
+        emotion: decision.emotion,
+        frustration: decision.frustration,
         url: pageState.url,
       });
 
-      // e. Emit socket event
+      // g. Emit legacy step event (backwards compat)
       if (io) {
         io.to(`run:${runId}`).emit('step', {
           sessionId,
           personaName: persona.name,
-          personaAvatar: persona.avatarSet?.default,
+          personaAvatar: persona.avatarSet?.default || persona.avatar,
           stepIndex,
-          action: llmAction.action,
-          x, y,
-          thought: llmAction.thought,
-          emotion: llmAction.emotion,
-          frustration: llmAction.frustration,
+          action: execResult.actionExecuted,
+          x: execResult.x,
+          y: execResult.y,
+          thought: decision.thought,
+          emotion: decision.emotion,
+          frustration: stepFrustration,
           screenshotUrl,
           url: pageState.url,
-        });
-
-        io.to(`run:${runId}`).emit('emotion', {
-          sessionId,
-          personaName: persona.name,
-          emotion: llmAction.emotion,
-          frustration: llmAction.frustration,
         });
       }
 
       stepIndex++;
 
-      // f. Stop conditions
-      if (llmAction.action === 'goal_complete') {
+      if (decision.action === 'goal_complete') {
         outcome = 'completed';
-        console.log(`[agent] ✅ ${persona.name} completed goal at step ${stepIndex}`);
         break;
       }
-      if (llmAction.action === 'give_up') {
+      if (decision.action === 'give_up') {
         outcome = 'gave_up';
-        console.log(`[agent] ❌ ${persona.name} gave up at step ${stepIndex}`);
         break;
       }
     }
 
     if (outcome === 'in_progress') {
-      // Hit max steps
       outcome = 'gave_up';
-      console.log(`[agent] ⏰ ${persona.name} hit max steps (${MAX_STEPS})`);
     }
 
-    // 3. Ask for final feedback
+    // Generate Persona Feedback Review
     let finalFeedback = '';
     try {
-      const feedbackPrompt = `You are ${persona.name}. You just tested this website with the goal: "${goal}".
+      const feedbackPrompt = `You are ${persona.name}. You just tested ${targetUrl} with the goal: "${goal}".
 The outcome was: ${outcome}.
-Your steps: ${stepHistory.map((h, i) => `${i + 1}. [${h.action}] ${h.thought}`).join('\n')}
+Steps taken:
+${stepHistory.map((h, i) => `${i + 1}. [${h.action}] ${h.thought}`).join('\n')}
 
-Write a short 2-3 sentence first-person review of your experience. Be authentic to your persona's voice and tech level.`;
-
+Write a concise 2-sentence first-person review of your experience. Cite specific issues encountered.`;
       finalFeedback = await callLLM(persona.systemPrompt, feedbackPrompt, { freeText: true });
-    } catch (err) {
+    } catch {
       finalFeedback = outcome === 'completed'
-        ? 'I managed to complete the task, though some steps were confusing.'
-        : 'I could not complete the task. The interface was too confusing for me.';
+        ? 'I completed the task successfully.'
+        : 'I encountered difficulty navigating the interface and could not complete the goal.';
     }
 
-    // 4. Run friction detection on this session's steps
-    const allSteps = await Step.find({ sessionId }).lean();
-    const friction = detectFriction(allSteps);
-
-    // 5. Update Session
     const totalTime = Math.round((Date.now() - startTime) / 1000);
+    const allSteps = await Step.find({ sessionId }).lean();
+
     const avgFrustration = allSteps.length
       ? Math.round(allSteps.reduce((s, st) => s + (st.frustration || 0), 0) / allSteps.length)
       : 0;
+
+    const missedCTA = outcome !== 'completed' && !primaryCTAClicked;
 
     await Session.findByIdAndUpdate(sessionId, {
       outcome,
       totalTime,
       frustrationScore: avgFrustration,
-      finalFeedback,
+      finalFeedback: finalFeedback.slice(0, 500),
       clickCount,
       rageClickCount,
-      missedCTA: friction.deadClicks.length > 0,
+      missedCTA,
     });
 
     if (io) {
       io.to(`run:${runId}`).emit('session:finished', {
         sessionId,
         personaName: persona.name,
+        personaAvatar: persona.avatarSet?.default || persona.avatar,
         outcome,
         frustrationScore: avgFrustration,
         finalFeedback,
+        screenshotUrl: await takeScreenshot(page, runId, stepIndex).catch(() => null),
       });
     }
 
-    console.log(`[agent] Session ${sessionId} done | ${persona.name} | outcome=${outcome} | steps=${stepIndex} | time=${totalTime}s`);
-
-    return { sessionId, personaName: persona.name, outcome, totalTime, avgFrustration, finalFeedback };
+    return {
+      sessionId,
+      personaName: persona.name,
+      outcome,
+      totalTime,
+      avgFrustration,
+      finalFeedback,
+      pageAudits,
+    };
 
   } finally {
-    await browser.close().catch(() => {});
+    await stopScreencast();
+    await context.close().catch(() => {});
   }
 }
 
-// ─── Run orchestrator (called by BullMQ) ─────────────────────────────────────
+// ─── Run Orchestrator ─────────────────────────────────────────────────────────
 
-/**
- * Process an entire run: create sessions for all personas, queue them,
- * run in batches (concurrency = process.env.AGENT_CONCURRENCY || 5),
- * then aggregate and write final summary.
- */
 export async function processAgentRun(runId, io) {
   const run = await Run.findById(runId);
   if (!run) throw new Error(`Run ${runId} not found`);
@@ -545,128 +810,205 @@ export async function processAgentRun(runId, io) {
   await Run.findByIdAndUpdate(runId, { status: 'running' });
   io?.to(`run:${runId}`).emit('run:started', { runId, personaCount: run.personaCount });
 
-  // Pick personas from DB (random selection)
   const personas = await Persona.find().limit(run.personaCount).lean();
   if (!personas.length) throw new Error('No personas found. Run `npm run seed` first.');
 
-  const concurrency = Number(process.env.AGENT_CONCURRENCY) || 5;
-  const sessionResults = [];
+  const CONCURRENCY = Math.max(1, Number(process.env.AGENT_CONCURRENCY) || 3);
+  const sharedBrowser = await getSharedBrowser();
+  const allPageAudits = [];
 
-  // Process in concurrency batches
-  for (let i = 0; i < personas.length; i += concurrency) {
-    const batch = personas.slice(i, i + concurrency);
+  try {
+    for (let i = 0; i < personas.length; i += CONCURRENCY) {
+      const batch = personas.slice(i, i + CONCURRENCY);
 
-    const batchPromises = batch.map(async (persona) => {
-      // Create session
-      const session = await Session.create({
-        runId,
-        personaId: persona._id,
-        personaSnapshot: {
-          name: persona.name,
-          age: persona.age,
-          tag: persona.traits?.ageGroup || 'unknown',
-          traits: persona.traits,
-          avatarSet: persona.avatarSet,
-        },
-        outcome: 'in_progress',
-      });
+      const batchPromises = batch.map(async (persona) => {
+        const session = await Session.create({
+          runId,
+          personaId: persona._id,
+          personaSnapshot: {
+            name: persona.name,
+            age: persona.age,
+            tag: persona.traits?.ageGroup || persona.tag || 'general',
+            traits: persona.traits,
+            avatar: persona.avatarSet?.default || persona.avatar,
+            avatarSet: persona.avatarSet,
+          },
+          outcome: 'in_progress',
+        });
 
-      io?.to(`run:${runId}`).emit('session:started', {
-        sessionId: session._id,
-        personaName: persona.name,
-        personaAvatar: persona.avatarSet?.default,
-      });
+        // session:started is now emitted inside runPersonaSession with viewport info
 
-      // Run as a fake BullMQ job
-      const fakeJob = {
-        data: {
+        const sessionJobData = {
           runId,
           sessionId: session._id.toString(),
           personaId: persona._id.toString(),
           goal: run.goal,
           url: run.url,
           device: run.device || 'desktop',
-        },
+        };
+
+        try {
+          const res = await runPersonaSession(sessionJobData, io, sharedBrowser);
+          if (res?.pageAudits) allPageAudits.push(...res.pageAudits);
+          return res;
+        } catch (err) {
+          console.error(`[agent] Session failed for ${persona.name}:`, err.message);
+          await Session.findByIdAndUpdate(session._id, {
+            outcome: 'failed',
+            finalFeedback: 'Session encountered an error: ' + err.message,
+          });
+          return { sessionId: session._id, personaName: persona.name, outcome: 'failed', error: err.message };
+        }
+      });
+
+      await Promise.all(batchPromises);
+    }
+
+    const sessions = await Session.find({ runId }).lean();
+    const allSteps = await Step.find({ runId }).lean();
+    const sessionsWithSteps = sessions.map((s) => ({
+      ...s,
+      steps: allSteps.filter((st) => st.sessionId?.toString() === s._id?.toString()),
+    }));
+
+    const allFailedSite = sessions.length > 0 && sessions.every((s) => s.outcome === 'failed');
+
+    if (allFailedSite) {
+      console.warn(`[agent] All sessions failed due to site unreachable: ${run.url}`);
+      const failedSummary = {
+        schemaVersion: 2,
+        totalSessions: sessions.length,
+        completedCount: 0,
+        gaveUpCount: 0,
+        taskSuccessRate: 0,
+        avgFrustration: 0,
+        avgSessionTime: 0,
+        ctaMissRate: 0,
+        frictionScore: 0,
+        errorMessage: 'Could not reach the site: connection refused or invalid URL.',
+        topIssues: [{
+          title: 'Site Unreachable',
+          severity: 'critical',
+          affectedCount: sessions.length,
+          description: `Could not reach ${run.url}. The server is offline or unreachable.`,
+          suggestedFix: 'Ensure the target website server is running and accessible.',
+        }],
+        personaTypeScores: [],
+        funnel: [],
+        heatmapPoints: [],
+        pageAudits: [],
       };
 
+      await Run.findByIdAndUpdate(runId, {
+        status: 'failed',
+        summary: failedSummary,
+        scores: { taskSuccessRate: 0, avgFrustration: 0, ctaMissRate: 0, avgSessionTime: 0 },
+        completedAt: new Date(),
+      });
+
+      io?.to(`run:${runId}`).emit('run:failed', { runId, error: 'Could not reach the site' });
+      return failedSummary;
+    }
+
+    let topIssues = [];
+    const validFeedbacks = sessions
+      .filter((s) => s.outcome !== 'failed' && s.finalFeedback)
+      .map((s) => ({
+        personaName: s.personaSnapshot?.name || 'Tester',
+        outcome: s.outcome,
+        feedback: s.finalFeedback,
+      }));
+
+    if (validFeedbacks.length > 0) {
       try {
-        const result = await runPersonaSession(fakeJob, io);
-        return result;
+        const summarySystemPrompt = 'You are a senior UX researcher analyzing real usability tests. You MUST ground every finding in the provided data.';
+        const summaryUserPrompt = buildSummaryPrompt(validFeedbacks, run.goal, run.url, allPageAudits);
+        const rawIssues = await callLLM(summarySystemPrompt, summaryUserPrompt, { schema: SUMMARY_SCHEMA });
+
+        const visitedCorpus = [
+          run.url,
+          ...allPageAudits.map((a) => `${a.pathname} ${(a.findings || []).map(f => f.detail + ' ' + f.text).join(' ')}`),
+          ...validFeedbacks.map((f) => f.feedback),
+        ].join(' ');
+
+        topIssues = filterAndGroundedIssues(rawIssues, validFeedbacks, allPageAudits, sessions.length, visitedCorpus);
       } catch (err) {
-        console.error(`[agent] Session failed for ${persona.name}:`, err.message);
-        await Session.findByIdAndUpdate(session._id, {
-          outcome: 'gave_up',
-          finalFeedback: 'Session failed due to an error.',
-        });
-        return { sessionId: session._id, personaName: persona.name, outcome: 'gave_up', error: err.message };
+        console.warn('[agent] Summary LLM call failed:', err.message);
+        topIssues = filterAndGroundedIssues([], validFeedbacks, allPageAudits, sessions.length, run.url);
       }
+    }
+
+    const metrics = buildRunMetrics(sessionsWithSteps);
+    const personaTypeScores = buildPerPersonaTypeScores(sessions);
+    const funnel = buildDropOffFunnel(sessionsWithSteps);
+
+    const summary = {
+      ...metrics,
+      topIssues,
+      personaTypeScores,
+      funnel,
+      pageAudits: allPageAudits.slice(0, 10),
+    };
+
+    await Run.findByIdAndUpdate(runId, {
+      status: 'completed',
+      summary,
+      scores: {
+        taskSuccessRate: metrics.taskSuccessRate,
+        avgFrustration: metrics.avgFrustration,
+        ctaMissRate: metrics.ctaMissRate,
+        avgSessionTime: metrics.avgSessionTime,
+      },
+      completedAt: new Date(),
     });
 
-    const batchResults = await Promise.all(batchPromises);
-    sessionResults.push(...batchResults);
-  }
-
-  // ── Final summary LLM call ────────────────────────────────────────────────
-  let topIssues = [];
-  try {
-    const sessions = await Session.find({ runId }).lean();
-    const feedbacks = sessions.map((s) => ({
-      personaName: s.personaSnapshot?.name || 'Unknown',
-      outcome: s.outcome,
-      feedback: s.finalFeedback || '',
-    })).filter((f) => f.feedback);
-
-    if (feedbacks.length > 0) {
-      const summarySystemPrompt = 'You are a senior UX researcher analyzing usability test results. Provide structured, actionable insights.';
-      const summaryUserPrompt = buildSummaryPrompt(feedbacks, run.goal, run.url);
-      topIssues = await callLLM(summarySystemPrompt, summaryUserPrompt, { schema: SUMMARY_SCHEMA });
+    if (run.userId) {
+      try {
+        const { default: Notification } = await import('../models/Notification.js');
+        await Notification.create({
+          userId: run.userId,
+          title: 'Run Completed',
+          message: `Usability test for ${run.url} finished with ${metrics.taskSuccessRate}% success rate.`,
+          type: 'run_completed',
+          link: `/app/dashboard?runId=${runId}`,
+        });
+      } catch (nErr) {
+        console.warn('[agent] Failed to create notification:', nErr.message);
+      }
     }
+
+    io?.to(`run:${runId}`).emit('run:finished', { runId, summary });
+
+    console.log(`[agent] ✅ Run ${runId} completed. Success: ${metrics.taskSuccessRate}% | Issues: ${topIssues.length}`);
+    return summary;
+
   } catch (err) {
-    console.warn('[agent] Summary LLM call failed:', err.message);
-    topIssues = [{
-      title: 'Unable to generate AI summary',
-      severity: 'low',
-      affectedCount: 0,
-      description: 'The LLM summary step failed. See individual session feedback.',
-      suggestedFix: 'Review individual persona feedback manually.',
-    }];
+    console.error(`[agent] Fatal error in processAgentRun ${runId}:`, err);
+    await Run.findByIdAndUpdate(runId, {
+      status: 'failed',
+      'summary.errorMessage': err.message,
+      completedAt: new Date(),
+    });
+
+    if (run?.userId) {
+      try {
+        const { default: Notification } = await import('../models/Notification.js');
+        await Notification.create({
+          userId: run.userId,
+          title: 'Run Failed',
+          message: `Usability test for ${run?.url || 'site'} failed: ${err.message}`,
+          type: 'run_failed',
+          link: `/app/dashboard?runId=${runId}`,
+        });
+      } catch (nErr) {}
+    }
+
+    io?.to(`run:${runId}`).emit('run:failed', { runId, error: err.message });
+    throw err;
   }
-
-  // ── Aggregate metrics ─────────────────────────────────────────────────────
-  const { buildRunMetrics, buildPerPersonaTypeScores, buildDropOffFunnel } = await import('../services/aggregator.js');
-  const sessions = await Session.find({ runId }).lean();
-  const allSteps = await (await import('../models/Step.js')).default.find({ runId }).lean();
-  const sessionsWithSteps = sessions.map((s) => ({
-    ...s,
-    steps: allSteps.filter((st) => st.sessionId?.toString() === s._id?.toString()),
-  }));
-
-  const metrics = buildRunMetrics(sessionsWithSteps);
-  const personaTypeScores = buildPerPersonaTypeScores(sessions);
-  const funnel = buildDropOffFunnel(sessionsWithSteps);
-
-  // ── Update Run with final summary ─────────────────────────────────────────
-  const summary = {
-    ...metrics,
-    topIssues,
-    personaTypeScores,
-    funnel,
-  };
-
-  await Run.findByIdAndUpdate(runId, {
-    status: 'completed',
-    summary,
-    scores: {
-      taskSuccessRate: metrics.taskSuccessRate,
-      avgFrustration: metrics.avgFrustration,
-      ctaMissRate: metrics.ctaMissRate,
-      avgSessionTime: metrics.avgSessionTime,
-    },
-    completedAt: new Date(),
-  });
-
-  io?.to(`run:${runId}`).emit('run:finished', { runId, summary });
-
-  console.log(`[agent] ✅ Run ${runId} complete. Success: ${metrics.taskSuccessRate}% | Issues: ${topIssues.length}`);
-  return summary;
 }
+
+export default {
+  runPersonaSession,
+  processAgentRun,
+};

@@ -5,7 +5,7 @@ export const ThemeToggle = ({ className = '' }) => {
   const [isDark, setIsDark] = useState(false);
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem('personify-theme');
+    const savedTheme = localStorage.getItem('vibetest-theme');
     if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
       setIsDark(true);
       document.documentElement.classList.add('dark');
@@ -21,12 +21,12 @@ export const ThemeToggle = ({ className = '' }) => {
     if (isDark) {
       document.documentElement.classList.remove('dark');
       document.documentElement.classList.add('light');
-      localStorage.setItem('personify-theme', 'light');
+      localStorage.setItem('vibetest-theme', 'light');
       setIsDark(false);
     } else {
       document.documentElement.classList.add('dark');
       document.documentElement.classList.remove('light');
-      localStorage.setItem('personify-theme', 'dark');
+      localStorage.setItem('vibetest-theme', 'dark');
       setIsDark(true);
     }
   };

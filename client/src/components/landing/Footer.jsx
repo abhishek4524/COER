@@ -1,5 +1,7 @@
 import React from 'react';
-import { Sparkles, Globe, MessageSquare, Share2 } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Globe, MessageSquare, Share2 } from 'lucide-react';
+import Logo from '../common/Logo';
 
 export const Footer = () => {
   return (
@@ -8,12 +10,9 @@ export const Footer = () => {
         
         {/* Left Logo & Status */}
         <div className="flex flex-col items-center md:items-start gap-3">
-          <div className="flex items-center gap-2.5 font-heading font-bold text-lg text-[#1C1C1E] dark:text-[#F2F2F7]">
-            <div className="w-7 h-7 rounded-xl bg-[#6C63FF] flex items-center justify-center text-white">
-              <Sparkles className="w-4 h-4" />
-            </div>
-            <span>Personify</span>
-          </div>
+          <Link to="/">
+            <Logo className="h-8 w-auto" />
+          </Link>
           <p className="text-xs text-[#6B6B70] dark:text-[#98989F]">
             Autonomous AI Persona Usability Platform.
           </p>
@@ -25,12 +24,12 @@ export const Footer = () => {
 
         {/* Center Links */}
         <div className="flex flex-wrap items-center justify-center gap-6 text-sm font-medium text-[#6B6B70] dark:text-[#98989F]">
-          <a href="#features" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Features</a>
-          <a href="#how-it-works" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">How it works</a>
-          <a href="#personas" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Personas</a>
-          <a href="#pricing" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Pricing</a>
-          <a href="#" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Privacy</a>
-          <a href="#" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Terms</a>
+          <a href="/#features" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Features</a>
+          <a href="/pricing" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Pricing</a>
+          <Link to="/privacy" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Privacy</Link>
+          <Link to="/terms" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Terms</Link>
+          <Link to="/refund" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Refund Policy</Link>
+          <Link to="/cookies" className="hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7] transition-colors">Cookies</Link>
         </div>
 
         {/* Right Copyright & Social Icons */}
@@ -46,7 +45,7 @@ export const Footer = () => {
               <Share2 className="w-4 h-4" />
             </a>
           </div>
-          <p>© {new Date().getFullYear()} Personify Inc. All rights reserved.</p>
+          <p>© {new Date().getFullYear()} VibeTest Inc. All rights reserved.</p>
         </div>
 
       </div>

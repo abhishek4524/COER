@@ -1,7 +1,8 @@
 /**
  * api.js — Centralized Data Access Layer
  * Supports real Express server REST calls with graceful fallback to mock data
- * when VITE_USE_MOCK="true" or when the backend is offline.
+ * ONLY when VITE_USE_MOCK="true".
+ * When VITE_USE_MOCK="false", all requests are sent to real backend with credentials.
  */
 
 import { all50Personas, personasData } from '../mock/personas.js';
@@ -96,32 +97,32 @@ export function normalizeSession(s) {
 export const getPersonas = async () => {
   if (USE_MOCK) return all50Personas;
   try {
-    const res = await fetch(`${API_URL}/personas?limit=50`);
+    const res = await fetch(`${API_URL}/personas?limit=50`, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
-    if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+    if (json.success && Array.isArray(json.data)) {
       return json.data.map(normalizePersona);
     }
-    return all50Personas;
+    return [];
   } catch (err) {
-    console.warn('[api] getPersonas fallback to mock:', err.message);
-    return all50Personas;
+    console.warn('[api] getPersonas error:', err.message);
+    return [];
   }
 };
 
 export const getPersonaById = async (id) => {
   if (USE_MOCK) return all50Personas.find(p => p.id === id) ?? null;
   try {
-    const res = await fetch(`${API_URL}/personas/${id}`);
+    const res = await fetch(`${API_URL}/personas/${id}`, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (json.success && json.data) {
       return normalizePersona(json.data);
     }
-    return all50Personas.find(p => p.id === id) ?? null;
+    return null;
   } catch (err) {
-    console.warn('[api] getPersonaById fallback to mock:', err.message);
-    return all50Personas.find(p => p.id === id) ?? null;
+    console.warn('[api] getPersonaById error:', err.message);
+    return null;
   }
 };
 
@@ -136,15 +137,14 @@ export const getSessions = async (runId) => {
     return runId ? allSessions.filter(s => s.runId === runId) : allSessions;
   }
   try {
-    const res = await fetch(`${API_URL}/runs/${runId}/sessions`);
+    const res = await fetch(`${API_URL}/runs/${runId}/sessions`, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
-    if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-      // Also fetch steps for each session if needed
+    if (json.success && Array.isArray(json.data)) {
       const populated = await Promise.all(
         json.data.map(async (sess) => {
           try {
-            const stepsRes = await fetch(`${API_URL}/sessions/${sess._id}/steps`);
+            const stepsRes = await fetch(`${API_URL}/sessions/${sess._id}/steps`, { credentials: 'include' });
             const stepsJson = await stepsRes.json();
             return normalizeSession({ ...sess, steps: stepsJson.data || [] });
           } catch {
@@ -154,10 +154,10 @@ export const getSessions = async (runId) => {
       );
       return populated;
     }
-    return allSessions.filter(s => s.runId === runId) || allSessions;
+    return [];
   } catch (err) {
-    console.warn('[api] getSessions fallback to mock:', err.message);
-    return allSessions.filter(s => s.runId === runId) || allSessions;
+    console.warn('[api] getSessions error:', err.message);
+    return [];
   }
 };
 
@@ -168,20 +168,20 @@ export const getSessionByPersonaId = async (personaId, runId) => {
     if (personaId) query.set('personaId', personaId);
     if (runId) query.set('runId', runId);
 
-    const res = await fetch(`${API_URL}/sessions?${query.toString()}`);
+    const res = await fetch(`${API_URL}/sessions?${query.toString()}`, { credentials: 'include' });
     if (res.ok) {
       const json = await res.json();
       if (json.success && json.data?.[0]) {
         const sess = json.data[0];
-        const stepsRes = await fetch(`${API_URL}/sessions/${sess._id}/steps`);
+        const stepsRes = await fetch(`${API_URL}/sessions/${sess._id}/steps`, { credentials: 'include' });
         const stepsJson = await stepsRes.json().catch(() => ({ data: [] }));
         return normalizeSession({ ...sess, steps: stepsJson.data || [] });
       }
     }
-    return allSessions.find(s => s.personaId === personaId) ?? null;
+    return null;
   } catch (err) {
-    console.warn('[api] getSessionByPersonaId fallback to mock:', err.message);
-    return allSessions.find(s => s.personaId === personaId) ?? null;
+    console.warn('[api] getSessionByPersonaId error:', err.message);
+    return null;
   }
 };
 
@@ -190,10 +190,10 @@ export const getSessionByPersonaId = async (personaId, runId) => {
 export const getRuns = async () => {
   if (USE_MOCK) return allRuns;
   try {
-    const res = await fetch(`${API_URL}/runs?limit=20`);
+    const res = await fetch(`${API_URL}/runs?limit=20`, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
-    if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+    if (json.success && Array.isArray(json.data)) {
       return json.data.map(r => ({
         id: r._id,
         _id: r._id,
@@ -208,10 +208,10 @@ export const getRuns = async () => {
         completedAt: r.completedAt,
       }));
     }
-    return allRuns;
+    return [];
   } catch (err) {
-    console.warn('[api] getRuns fallback to mock:', err.message);
-    return allRuns;
+    console.warn('[api] getRuns error:', err.message);
+    return [];
   }
 };
 
@@ -220,7 +220,7 @@ export const getRunById = async (id) => {
     return allRuns.find(r => r.id === id) ?? allRuns[0];
   }
   try {
-    const res = await fetch(`${API_URL}/runs/${id}`);
+    const res = await fetch(`${API_URL}/runs/${id}`, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (json.success && json.data) {
@@ -239,26 +239,75 @@ export const getRunById = async (id) => {
         completedAt: r.completedAt,
       };
     }
-    return allRuns[0];
+    return null;
   } catch (err) {
-    console.warn('[api] getRunById fallback to mock:', err.message);
-    return allRuns.find(r => r.id === id) ?? allRuns[0];
+    console.warn('[api] getRunById error:', err.message);
+    return null;
   }
 };
 
-// ─── Metrics & Insights ──────────────────────────────────────────────────────
+// ─── Single Source of Truth: Run Report API ─────────────────────────────────
+
+export const getRunReport = async (runId) => {
+  if (USE_MOCK || !runId || runId === 'run-2024-001') {
+    return {
+      run: allRuns[0],
+      metrics: runMetrics,
+      funnel: funnelData.map(f => ({ stage: f.label || f.stage, count: f.count, pct: f.pct })),
+      insights: insightsData.map((ins, idx) => ({ ...ins, id: `ins-${idx}` })),
+      personaTypeScores: [
+        { tag: 'Gen-Z', successRate: 75, avgFrustration: 25, sessionCount: 15 },
+        { tag: 'Senior', successRate: 40, avgFrustration: 60, sessionCount: 10 },
+      ],
+      sessions: allSessions.map(normalizeSession),
+      screens: testedScreens,
+      heatmapPoints: generateHeatmapPoints(60),
+    };
+  }
+
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/report`, { credentials: 'include' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.success && json.data) {
+      const d = json.data;
+      return {
+        run: d.run,
+        metrics: d.metrics,
+        insights: d.insights || [],
+        funnel: d.funnel || [],
+        personaTypeScores: d.personaTypeScores || [],
+        sessions: (d.sessions || []).map(normalizeSession),
+        screens: (d.screens || []).map((scr, idx) => ({
+          ...scr,
+          id: scr.id || `scr-${idx}`,
+          label: scr.label || scr.name || `Screen ${idx + 1}`,
+          screenshot: scr.screenshot || '/assets/steps/product.png',
+          thumbnail: scr.thumbnail || scr.screenshot || '/assets/steps/product.png',
+        })),
+        heatmapPoints: d.heatmapPoints || [],
+      };
+    }
+    return null;
+  } catch (err) {
+    console.warn('[api] getRunReport error:', err.message);
+    return null;
+  }
+};
 
 export const getRunMetrics = async (runId) => {
   if (USE_MOCK || !runId || runId === 'run-2024-001') return runMetrics;
   try {
     const run = await getRunById(runId);
-    if (!run || !run.summary) return runMetrics;
+    if (!run || !run.summary) return null;
 
     const s = run.summary;
-    const taskSuccessRate = s.taskSuccessRate ?? run.scores?.taskSuccessRate ?? 50;
-    const avgFrustration = s.avgFrustration ?? run.scores?.avgFrustration ?? 40;
-    const ctaMissRate = s.ctaMissRate ?? run.scores?.ctaMissRate ?? 25;
-    const avgSessionTime = s.avgSessionTime ?? run.scores?.avgSessionTime ?? 60;
+    const taskSuccessRate = s.taskSuccessRate ?? run.scores?.taskSuccessRate ?? 0;
+    const avgFrustration = s.avgFrustration ?? run.scores?.avgFrustration ?? 0;
+    const ctaMissRate = s.ctaMissRate ?? run.scores?.ctaMissRate ?? 0;
+    const avgSessionTime = s.avgSessionTime ?? run.scores?.avgSessionTime ?? 0;
+
+    if (s.totalSessions === 0 && taskSuccessRate === 0) return null;
 
     return {
       taskSuccessRate,
@@ -293,8 +342,8 @@ export const getRunMetrics = async (runId) => {
       },
     };
   } catch (err) {
-    console.warn('[api] getRunMetrics fallback to mock:', err.message);
-    return runMetrics;
+    console.warn('[api] getRunMetrics error:', err.message);
+    return null;
   }
 };
 
@@ -309,10 +358,10 @@ export const getFunnelData = async (runId) => {
         pct: f.pct,
       }));
     }
-    return funnelData;
+    return null;
   } catch (err) {
-    console.warn('[api] getFunnelData fallback to mock:', err.message);
-    return funnelData;
+    console.warn('[api] getFunnelData error:', err.message);
+    return null;
   }
 };
 
@@ -325,17 +374,17 @@ export const getInsights = async (runId) => {
         id: `ins-real-${idx}`,
         icon: issue.severity === 'critical' ? 'AlertTriangle' : issue.severity === 'high' ? 'Zap' : 'MessageSquare',
         severity: issue.severity,
-        title: issue.title,
-        description: issue.description,
+        issue: issue.title,
+        detail: issue.description,
         suggestedFix: issue.suggestedFix,
         affectedCount: issue.affectedCount || 1,
-        affectedPersonaIds: ['p1', 'p2', 'p3'],
+        affectedPersonaIds: [],
       }));
     }
-    return insightsData;
+    return null;
   } catch (err) {
-    console.warn('[api] getInsights fallback to mock:', err.message);
-    return insightsData;
+    console.warn('[api] getInsights error:', err.message);
+    return null;
   }
 };
 
@@ -344,24 +393,42 @@ export const getInsights = async (runId) => {
 export const getTestedScreens = async (runId) => {
   if (USE_MOCK || !runId || runId === 'run-2024-001') return testedScreens;
   try {
-    const res = await fetch(`${API_URL}/runs/${runId}/screens`);
+    const res = await fetch(`${API_URL}/runs/${runId}/screens`, { credentials: 'include' });
     if (res.ok) {
       const json = await res.json();
-      if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-        return json.data.map((scr, idx) => ({
-          ...scr,
-          screenshot: scr.screenshot || testedScreens[idx % testedScreens.length].screenshot,
-          thumbnail: scr.thumbnail || testedScreens[idx % testedScreens.length].thumbnail,
-          topHotspot: scr.topHotspot || { label: scr.name, x: 600, y: 400, density: '82%', clicks: scr.clickPoints?.length || 15 },
-          suggestedFix: scr.suggestedFix || 'Simplify navigation and increase contrast on primary action buttons.',
-          affectedCount: scr.affectedCount || Math.min(50, (scr.rageClusters?.length || 1) * 3),
-        }));
+      if (json.success && Array.isArray(json.data)) {
+        return json.data.map((scr, idx) => {
+          const clickPoints = scr.clickPoints || [];
+          const hotspots = (scr.hotspots && scr.hotspots.length > 0)
+            ? scr.hotspots
+            : clickPoints.map((pt, pIdx) => ({
+                id: `hs-${pIdx}`,
+                cx: pt.x,
+                cy: pt.y,
+                baseClicks: 15,
+                rageClicks: pt.type === 'rage' ? 10 : 0,
+                type: pt.type,
+                label: `Interaction (${pt.x}, ${pt.y})`,
+              }));
+
+          return {
+            ...scr,
+            id: scr.id || `scr-${idx}`,
+            label: scr.label || scr.name || `Screen ${idx + 1}`,
+            screenshot: scr.screenshot || '/assets/steps/product.png',
+            thumbnail: scr.thumbnail || scr.screenshot || '/assets/steps/product.png',
+            topHotspot: scr.topHotspot || (hotspots[0] ? { label: scr.label, x: hotspots[0].cx, y: hotspots[0].cy, density: '85%', clicks: clickPoints.length } : null),
+            suggestedFix: scr.suggestedFix || 'Simplify navigation and increase contrast on primary action buttons.',
+            affectedCount: scr.affectedCount || Math.max(1, (scr.rageClusters?.length || 0) + (scr.deadClickPoints?.length || 0)),
+            hotspots,
+          };
+        });
       }
     }
-    return testedScreens;
+    return [];
   } catch (err) {
-    console.warn('[api] getTestedScreens fallback to mock:', err.message);
-    return testedScreens;
+    console.warn('[api] getTestedScreens error:', err.message);
+    return [];
   }
 };
 
@@ -372,11 +439,12 @@ export const getScreenHeatmapData = async (screenId = 'otp', { personaType = 'al
   }
   try {
     const screens = await getTestedScreens(runId);
-    const screen = screens.find(s => s.id === screenId) || screens[0] || testedScreens[0];
-    return { ...screen, screenId: screen.id };
+    const screen = screens.find(s => s.id === screenId) || screens[0];
+    if (screen) return { ...screen, screenId: screen.id };
+    return null;
   } catch (err) {
-    const screen = testedScreens.find(s => s.id === screenId) || testedScreens[3];
-    return { ...screen, screenId: screen.id };
+    console.warn('[api] getScreenHeatmapData error:', err.message);
+    return null;
   }
 };
 
@@ -395,9 +463,9 @@ export const getHeatmapPoints = async (runId, filter = 'all') => {
     if (Array.isArray(points) && points.length > 0) {
       return filter === 'all' ? points : points.filter(p => p.type === filter);
     }
-    return generateHeatmapPoints(140);
+    return [];
   } catch {
-    return generateHeatmapPoints(140);
+    return [];
   }
 };
 
@@ -416,6 +484,7 @@ export const submitNewRun = async (config) => {
     const res = await fetch(`${API_URL}/runs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify(config),
     });
     const json = await res.json();
@@ -431,13 +500,243 @@ export const submitNewRun = async (config) => {
       config,
     };
   } catch (err) {
-    console.warn('[api] submitNewRun server failed, falling back to mock:', err.message);
+    console.error('[api] submitNewRun failed:', err.message);
     return {
-      success: true,
-      runId: `mock-run-${Date.now()}`,
-      estimatedSeconds: config.personaCount * 12,
-      config,
-      isFallback: true,
+      success: false,
+      error: err.message || 'Could not connect to server. Is it running on port 5000?',
     };
   }
 };
+
+// ─── Projects API ─────────────────────────────────────────────────────────────
+
+export const getProjects = async () => {
+  if (USE_MOCK) return [];
+  try {
+    const res = await fetch(`${API_URL}/projects`, { credentials: 'include' });
+    const json = await res.json();
+    return json.projects || [];
+  } catch (err) {
+    console.warn('[api] getProjects error:', err.message);
+    return [];
+  }
+};
+
+export const createProject = async (data) => {
+  try {
+    const res = await fetch(`${API_URL}/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to create project');
+    return json.project;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const updateProject = async (id, data) => {
+  try {
+    const res = await fetch(`${API_URL}/projects/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to update project');
+    return json.project;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const deleteProject = async (id) => {
+  try {
+    const res = await fetch(`${API_URL}/projects/${id}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to delete project');
+    return true;
+  } catch (err) {
+    throw err;
+  }
+};
+
+// ─── Notifications API ───────────────────────────────────────────────────────
+
+export const getNotifications = async () => {
+  if (USE_MOCK) return { notifications: [], unreadCount: 0 };
+  try {
+    const res = await fetch(`${API_URL}/notifications`, { credentials: 'include' });
+    const json = await res.json();
+    return json;
+  } catch (err) {
+    console.warn('[api] getNotifications error:', err.message);
+    return { notifications: [], unreadCount: 0 };
+  }
+};
+
+export const markNotificationRead = async (id) => {
+  try {
+    const res = await fetch(`${API_URL}/notifications/${id}/read`, {
+      method: 'PATCH',
+      credentials: 'include',
+    });
+    return await res.json();
+  } catch (err) {
+    console.warn('[api] markNotificationRead error:', err.message);
+  }
+};
+
+export const markAllNotificationsRead = async () => {
+  try {
+    const res = await fetch(`${API_URL}/notifications/read-all`, {
+      method: 'POST',
+      credentials: 'include',
+    });
+    return await res.json();
+  } catch (err) {
+    console.warn('[api] markAllNotificationsRead error:', err.message);
+  }
+};
+
+// ─── Admin API ───────────────────────────────────────────────────────────────
+
+export const getAdminStats = async () => {
+  try {
+    const res = await fetch(`${API_URL}/admin/stats`, { credentials: 'include' });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to fetch admin stats');
+    return json;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const updateUserRole = async (userId, role) => {
+  try {
+    const res = await fetch(`${API_URL}/admin/users/${userId}/role`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ role }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to update user role');
+    return json.user;
+  } catch (err) {
+    throw err;
+  }
+};
+
+// ─── Sharing & Run Management ───────────────────────────────────────────────
+
+export const generateShareToken = async (runId, expiresAt = null) => {
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ expiresAt }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to create share link');
+    return json;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const revokeShareToken = async (runId) => {
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/share`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to revoke share link');
+    return json;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const getSharedReport = async (token) => {
+  try {
+    const res = await fetch(`${API_URL}/shared/${token}`);
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Shared report unavailable');
+    return json.data;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const deleteRun = async (runId) => {
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to delete run');
+    return true;
+  } catch (err) {
+    throw err;
+  }
+};
+
+// ─── Settings & API Keys ─────────────────────────────────────────────────────
+
+export const updateUserSettings = async (settings) => {
+  try {
+    const res = await fetch(`${API_URL}/auth/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(settings),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to update settings');
+    return json.settings;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const generateApiKey = async (name) => {
+  try {
+    const res = await fetch(`${API_URL}/auth/api-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ name }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to generate API key');
+    return json;
+  } catch (err) {
+    throw err;
+  }
+};
+
+export const revokeApiKey = async (keyId) => {
+  try {
+    const res = await fetch(`${API_URL}/auth/api-key/${keyId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to revoke API key');
+    return true;
+  } catch (err) {
+    throw err;
+  }
+};
+

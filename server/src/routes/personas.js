@@ -1,18 +1,29 @@
 import { Router } from 'express';
 import Persona from '../models/Persona.js';
+import { protect } from '../middleware/auth.js';
 
 const router = Router();
+
+router.use(protect);
 
 // GET /api/personas
 router.get('/', async (req, res, next) => {
   try {
     const { search, tag, page = 1, limit = 50 } = req.query;
-    const filter = {};
+
+    const filter = {
+      $or: [
+        { isCustom: false },
+        { userId: null },
+        { userId: req.user._id },
+      ],
+    };
+
     if (search) filter.name = { $regex: search, $options: 'i' };
     if (tag) filter['traits.ageGroup'] = tag;
 
     const personas = await Persona.find(filter)
-      .sort({ createdAt: -1 })
+      .sort({ isCustom: 1, createdAt: -1 })
       .limit(Number(limit))
       .skip((Number(page) - 1) * Number(limit));
 
@@ -29,6 +40,11 @@ router.get('/:id', async (req, res, next) => {
   try {
     const persona = await Persona.findById(req.params.id);
     if (!persona) return res.status(404).json({ success: false, error: 'Persona not found' });
+
+    if (persona.isCustom && persona.userId && !persona.userId.equals(req.user._id)) {
+      return res.status(404).json({ success: false, error: 'Persona not found' });
+    }
+
     res.json({ success: true, data: persona });
   } catch (err) {
     next(err);
@@ -38,7 +54,11 @@ router.get('/:id', async (req, res, next) => {
 // POST /api/personas
 router.post('/', async (req, res, next) => {
   try {
-    const persona = await Persona.create(req.body);
+    const persona = await Persona.create({
+      ...req.body,
+      userId: req.user._id,
+      isCustom: true,
+    });
     res.status(201).json({ success: true, data: persona });
   } catch (err) {
     next(err);
@@ -48,11 +68,17 @@ router.post('/', async (req, res, next) => {
 // PATCH /api/personas/:id
 router.patch('/:id', async (req, res, next) => {
   try {
+    const existing = await Persona.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: 'Persona not found' });
+
+    if (existing.isCustom && existing.userId && !existing.userId.equals(req.user._id)) {
+      return res.status(404).json({ success: false, error: 'Persona not found' });
+    }
+
     const persona = await Persona.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
       runValidators: true,
     });
-    if (!persona) return res.status(404).json({ success: false, error: 'Persona not found' });
     res.json({ success: true, data: persona });
   } catch (err) {
     next(err);
@@ -62,8 +88,14 @@ router.patch('/:id', async (req, res, next) => {
 // DELETE /api/personas/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const persona = await Persona.findByIdAndDelete(req.params.id);
-    if (!persona) return res.status(404).json({ success: false, error: 'Persona not found' });
+    const existing = await Persona.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: 'Persona not found' });
+
+    if (existing.isCustom && existing.userId && !existing.userId.equals(req.user._id)) {
+      return res.status(404).json({ success: false, error: 'Persona not found' });
+    }
+
+    await Persona.findByIdAndDelete(req.params.id);
     res.json({ success: true, message: 'Persona deleted' });
   } catch (err) {
     next(err);

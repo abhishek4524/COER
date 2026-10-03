@@ -13,10 +13,10 @@ export const HeatmapSliderSection = () => {
       <div className="text-center max-w-3xl mx-auto mb-16 space-y-4">
         <Badge variant="accent">Cognitive Intelligence</Badge>
         <h2 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold font-heading text-[#1C1C1E] dark:text-[#F2F2F7]">
-          Standard Heatmaps vs Personify AI
+          Standard Heatmaps vs VibeTest AI
         </h2>
         <p className="text-base sm:text-lg text-[#6B6B70] dark:text-[#98989F]">
-          Drag the slider below to compare traditional click aggregations against Personify's persona-level cognitive friction mapping.
+          Drag the slider below to compare traditional click aggregations against VibeTest's persona-level cognitive friction mapping.
         </p>
       </div>
 
@@ -33,13 +33,13 @@ export const HeatmapSliderSection = () => {
             <Slider
               value={sliderVal}
               onChange={setSliderVal}
-              label="Reveal Personify Layer"
+              label="Reveal VibeTest Layer"
             />
           </div>
 
           <div className="flex items-center gap-2 text-sm font-semibold text-[#F08A7E]">
             <Sparkles className="w-4 h-4" />
-            Personify Cognitive Heatmap ({sliderVal}%)
+            VibeTest Cognitive Heatmap ({sliderVal}%)
           </div>
         </div>
 
