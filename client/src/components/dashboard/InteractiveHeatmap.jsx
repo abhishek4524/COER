@@ -18,6 +18,7 @@ import {
   Compass,
   Eye,
   Sliders,
+  Download,
 } from 'lucide-react';
 import SmartImage from '../ui/SmartImage';
 import Badge from '../ui/Badge';
@@ -53,11 +54,22 @@ export const InteractiveHeatmap = ({ runId }) => {
   const [personaFilter, setPersonaFilter] = useState('all');
   const [outcomeFilter, setOutcomeFilter] = useState('all');
   const [fixExpanded, setFixExpanded] = useState(true);
+  const [imgError, setImgError] = useState(false);
+  const [imgLoading, setImgLoading] = useState(true);
 
   // Replay scrubber state
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0); // 0 - 45 seconds
+  const [currentTime, setCurrentTime] = useState(0);
   const [replayEvents, setReplayEvents] = useState([]);
+
+  // Max replay duration from events or default 45s
+  const maxReplayTime = useMemo(() => {
+    if (replayEvents.length > 0) {
+      const maxTime = Math.max(...replayEvents.map(e => e.time || 0));
+      return Math.max(10, Math.ceil(maxTime));
+    }
+    return 45;
+  }, [replayEvents]);
 
   // Active hovered pin or hotspot
   const [hoveredPin, setHoveredPin] = useState(null);
@@ -69,6 +81,40 @@ export const InteractiveHeatmap = ({ runId }) => {
   // Check prefers-reduced-motion
   const prefersReducedMotion = typeof window !== 'undefined'
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Export Heatmap + Overlay as PNG
+  const handleDownloadHeatmap = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = canvas.width;
+    exportCanvas.height = canvas.height;
+    const ctx = exportCanvas.getContext('2d');
+
+    const imgSrc = screenData?.screenshot || screenData?.thumbnail || '/assets/steps/product.png';
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = imgSrc;
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, exportCanvas.width, exportCanvas.height);
+      ctx.drawImage(canvas, 0, 0);
+      const link = document.createElement('a');
+      link.download = `heatmap-${selectedScreenId || 'export'}.png`;
+      link.href = exportCanvas.toDataURL('image/png');
+      link.click();
+    };
+    img.onerror = () => {
+      // Draw canvas only if image fails
+      ctx.fillStyle = '#17171B';
+      ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+      ctx.drawImage(canvas, 0, 0);
+      const link = document.createElement('a');
+      link.download = `heatmap-${selectedScreenId || 'export'}.png`;
+      link.href = exportCanvas.toDataURL('image/png');
+      link.click();
+    };
+  }, [screenData, selectedScreenId]);
 
   // ─── Load initial screens list from api.js ─────────────────────────────────
   useEffect(() => {
@@ -83,6 +129,8 @@ export const InteractiveHeatmap = ({ runId }) => {
   // ─── Load screen data when selected screen changes ────────────────────────
   useEffect(() => {
     if (!selectedScreenId) return;
+    setImgError(false);
+    setImgLoading(true);
     getScreenHeatmapData(selectedScreenId, { personaType: personaFilter, outcome: outcomeFilter }, runId)
       .then(data => {
         setScreenData(data);
@@ -100,16 +148,16 @@ export const InteractiveHeatmap = ({ runId }) => {
     if (isPlaying) {
       interval = setInterval(() => {
         setCurrentTime(t => {
-          if (t >= 45) {
+          if (t >= maxReplayTime) {
             setIsPlaying(false);
-            return 45;
+            return maxReplayTime;
           }
           return t + 1;
         });
       }, 500); // 500ms per simulated second
     }
     return () => clearInterval(interval);
-  }, [isPlaying]);
+  }, [isPlaying, maxReplayTime]);
 
   // ─── Filtered hotspots based on persona type & outcome ────────────────────
   const currentHotspots = useMemo(() => {
@@ -343,8 +391,8 @@ export const InteractiveHeatmap = ({ runId }) => {
           ))}
         </div>
 
-        {/* Outcome Filter */}
-        <div className="flex items-center gap-1.5">
+        {/* Outcome Filter & Download Button */}
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-semibold text-[#6B6B70] dark:text-[#98989F] mr-1">Outcome:</span>
           {OUTCOME_FILTERS.map(o => (
             <button
@@ -358,6 +406,14 @@ export const InteractiveHeatmap = ({ runId }) => {
               {o.label}
             </button>
           ))}
+          <button
+            onClick={handleDownloadHeatmap}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-[#6C63FF] text-white hover:bg-[#5B54E8] transition-colors shadow-xs ml-auto"
+            title="Export heatmap screenshot with overlay"
+          >
+            <Download size={13} />
+            Download heatmap PNG
+          </button>
         </div>
       </div>
 
@@ -385,19 +441,29 @@ export const InteractiveHeatmap = ({ runId }) => {
             /* ── 2. 2D THERMAL GLOW VIEW ── */
             <div ref={containerRef} className="relative w-full aspect-[16/10] overflow-hidden select-none">
               
-              {/* Background Screenshot with cross-fade */}
-              <AnimatePresence mode="wait">
-                <motion.img
-                  key={screenData?.id || selectedScreenId}
-                  src={screenData?.screenshot || screenData?.thumbnail || '/assets/steps/product.png'}
-                  alt={screenData?.name || screenData?.label || 'Screen'}
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.4 }}
-                  className="w-full h-full object-cover block"
-                />
-              </AnimatePresence>
+              {/* Background Screenshot with fallback error UI */}
+              {imgError ? (
+                <div className="w-full h-full min-h-[360px] bg-[#F7F6F3] dark:bg-[#141418] flex flex-col items-center justify-center gap-2 text-[#6B6B70] dark:text-[#98989F] p-6 text-center">
+                  <AlertTriangle size={32} className="text-[#F08A7E]" />
+                  <p className="text-sm font-semibold text-[#1C1C1E] dark:text-[#F2F2F7]">Screenshot unavailable</p>
+                  <p className="text-xs max-w-sm">The target website screenshot could not be captured. Usability data and click hotspots are still active above.</p>
+                </div>
+              ) : (
+                <AnimatePresence mode="wait">
+                  <motion.img
+                    key={screenData?.id || selectedScreenId}
+                    src={screenData?.screenshot || screenData?.thumbnail || '/assets/steps/product.png'}
+                    alt={screenData?.name || screenData?.label || 'Screen'}
+                    onError={() => setImgError(true)}
+                    onLoad={() => setImgLoading(false)}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.4 }}
+                    className="w-full h-full object-cover block"
+                  />
+                </AnimatePresence>
+              )}
 
               {/* Thermal Glow Canvas with 800ms Ease-Out Fade & 4% Breathing Pulse */}
               <motion.canvas

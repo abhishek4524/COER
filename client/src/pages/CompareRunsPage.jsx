@@ -1,8 +1,22 @@
+/**
+ * CompareRunsPage.jsx
+ *
+ * Two-tab layout:
+ *   "Fix preview" (new, default after a run) — Simulated fix emulator
+ *   "Run vs run"  (existing, real data)       — Side-by-side heatmap comparison
+ *
+ * Simulated preview content is clearly labeled and never mixed with real run data.
+ */
+
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { motion } from 'framer-motion';
-import { TrendingUp, TrendingDown, Minus, Eye, MousePointer, Flame, ChevronDown } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  TrendingUp, TrendingDown, Minus, Eye, MousePointer,
+  Flame, ChevronDown, Wrench, BarChart3,
+} from 'lucide-react';
 import Card from '../components/ui/Card';
 import Badge from '../components/ui/Badge';
+import FixPreviewTab from '../components/fix/FixPreviewTab';
 import { getRuns, getRunReport } from '../services/api';
 
 // ─── Canvas heatmap renderer ────────────────────────────────────────────────
@@ -74,7 +88,7 @@ const HeatmapSplit = ({ runA, runB, filter }) => {
       style={{ aspectRatio: '16/9' }}
     >
       {/* Background image full width — Run A */}
-      <img src={runA?.screenshot || "/assets/checkout-v1-broken.png"} alt={runA?.label || "Run A"} className="w-full h-full object-cover absolute inset-0" />
+      <img src={runA?.screenshot || "/assets/steps/product.png"} alt={runA?.label || "Run A"} className="w-full h-full object-cover absolute inset-0" />
 
       {/* Run A canvas — clipped to left side */}
       <div className="absolute inset-0" style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}>
@@ -83,7 +97,7 @@ const HeatmapSplit = ({ runA, runB, filter }) => {
 
       {/* Run B overlay — clipped to right side */}
       <div className="absolute inset-0" style={{ clipPath: `inset(0 0 0 ${splitPct}%)` }}>
-        <img src={runB?.screenshot || "/assets/checkout-v2-optimized.png"} alt={runB?.label || "Run B"} className="w-full h-full object-cover absolute inset-0" />
+        <img src={runB?.screenshot || "/assets/steps/product.png"} alt={runB?.label || "Run B"} className="w-full h-full object-cover absolute inset-0" />
         <canvas ref={canvasBRef} width={760} height={428} className="w-full h-full" />
       </div>
 
@@ -103,12 +117,14 @@ const HeatmapSplit = ({ runA, runB, filter }) => {
         <span className="px-2.5 py-1 text-xs font-semibold text-white rounded-full"
           style={{ background: runA?.color ?? '#6C63FF' }}>
           {runA?.label ?? 'Run A'}
+          {runA?.simulated && <span className="ml-1 opacity-80">· Simulated preview</span>}
         </span>
       </div>
       <div className="absolute top-3 right-3 z-10">
         <span className="px-2.5 py-1 text-xs font-semibold text-white rounded-full"
           style={{ background: runB?.color ?? '#8FB8A8' }}>
           {runB?.label ?? 'Run B'}
+          {runB?.simulated && <span className="ml-1 opacity-80">· Simulated preview</span>}
         </span>
       </div>
     </div>
@@ -145,37 +161,30 @@ const DeltaCard = ({ label, aVal, bVal, unit = '', higherIsBetter = true }) => {
   );
 };
 
-// ─── Main CompareRunsPage ──────────────────────────────────────────────────
-export const CompareRunsPage = () => {
-  const [allRuns, setAllRuns] = useState([]);
-  const [loading, setLoading] = useState(true);
+// ─── Run vs Run Tab ────────────────────────────────────────────────────────
+const RunVsRunTab = ({ allRuns }) => {
   const [runAId, setRunAId] = useState('');
   const [runBId, setRunBId] = useState('');
   const [runAReport, setRunAReport] = useState(null);
   const [runBReport, setRunBReport] = useState(null);
   const [heatmapFilter, setHeatmapFilter] = useState('all');
 
-  // Load real runs from API
   useEffect(() => {
-    getRuns().then((runs) => {
-      if (Array.isArray(runs) && runs.length > 0) {
-        setAllRuns(runs);
-        setRunAId(runs[0]?.id || runs[0]?._id || '');
-        setRunBId(runs[1]?.id || runs[1]?._id || runs[0]?.id || '');
-      }
-      setLoading(false);
-    }).catch(() => setLoading(false));
-  }, []);
+    if (allRuns.length > 0) {
+      setRunAId(allRuns[0]?.id || allRuns[0]?._id || '');
+      setRunBId(allRuns[1]?.id || allRuns[1]?._id || allRuns[0]?.id || '');
+    }
+  }, [allRuns]);
 
-  // Fetch report for runA
   useEffect(() => {
     if (!runAId) return;
-    getRunReport(runAId).then((r) => {
+    getRunReport(runAId).then(r => {
       if (r) setRunAReport({
         id: runAId,
         label: r.run?.url || runAId,
         date: r.run?.createdAt ? new Date(r.run.createdAt).toLocaleDateString() : '',
         color: '#6C63FF',
+        simulated: r.run?.simulated || false,
         taskSuccess: r.metrics?.taskSuccessRate ?? 0,
         avgFrustration: r.metrics?.avgFrustration ?? 0,
         ctaMissRate: r.metrics?.ctaMissRate ?? 0,
@@ -185,15 +194,15 @@ export const CompareRunsPage = () => {
     });
   }, [runAId]);
 
-  // Fetch report for runB
   useEffect(() => {
     if (!runBId || runBId === runAId) return;
-    getRunReport(runBId).then((r) => {
+    getRunReport(runBId).then(r => {
       if (r) setRunBReport({
         id: runBId,
         label: r.run?.url || runBId,
         date: r.run?.createdAt ? new Date(r.run.createdAt).toLocaleDateString() : '',
         color: '#8FB8A8',
+        simulated: r.run?.simulated || false,
         taskSuccess: r.metrics?.taskSuccessRate ?? 0,
         avgFrustration: r.metrics?.avgFrustration ?? 0,
         ctaMissRate: r.metrics?.ctaMissRate ?? 0,
@@ -201,7 +210,7 @@ export const CompareRunsPage = () => {
         heatmapPoints: r.heatmapPoints || [],
       });
     });
-  }, [runBId]);
+  }, [runBId, runAId]);
 
   const runA = runAReport;
   const runB = runBReport;
@@ -228,6 +237,7 @@ export const CompareRunsPage = () => {
           {allRuns.map(r => (
             <option key={r.id || r._id} value={r.id || r._id}>
               {r.url || r.label || r.id} — {r.createdAt ? new Date(r.createdAt).toLocaleDateString() : ''}
+              {r.simulated ? ' · Simulated preview' : ''}
             </option>
           ))}
         </select>
@@ -236,30 +246,21 @@ export const CompareRunsPage = () => {
     </div>
   );
 
-  if (loading) {
-    return <div className="flex items-center justify-center h-64 text-[#6B6B70] dark:text-[#98989F] text-sm">Loading runs…</div>;
-  }
-
-  if (allRuns.length < 2) {
-    return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3 text-center">
-        <p className="text-lg font-semibold text-[#1C1C1E] dark:text-[#F2F2F7]">Not Enough Runs</p>
-        <p className="text-sm text-[#6B6B70] dark:text-[#98989F]">
-          You need at least 2 completed runs to compare. Start a new run from the{' '}
-          <a href="/app/new-run" className="text-[#6C63FF] underline">New Run page</a>.
-        </p>
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col gap-6">
-
       {/* Run selectors */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <SelectRun value={runAId} onChange={setRunAId} label="Before (Run A)" />
         <SelectRun value={runBId} onChange={setRunBId} label="After (Run B)" />
       </div>
+
+      {/* Simulated warning if any run is simulated */}
+      {(runA?.simulated || runB?.simulated) && (
+        <div className="flex items-center gap-2 px-4 py-2.5 bg-[#6C63FF]/10 border border-[#6C63FF]/20 rounded-2xl text-xs text-[#6C63FF]">
+          <Wrench size={12} />
+          One or more selected runs is a simulated patched run. Metrics are labeled accordingly.
+        </div>
+      )}
 
       {/* Delta metrics */}
       <motion.div
@@ -308,7 +309,10 @@ export const CompareRunsPage = () => {
                 <tr className="border-b border-[#ECEAE5] dark:border-[#26262F]">
                   <th className="py-2 text-left text-xs font-semibold text-[#6B6B70] dark:text-[#98989F]">Metric</th>
                   <th className="py-2 text-right text-xs font-semibold" style={{ color: runA.color }}>{runA.label}</th>
-                  <th className="py-2 text-right text-xs font-semibold" style={{ color: runB.color }}>{runB.label}</th>
+                  <th className="py-2 text-right text-xs font-semibold" style={{ color: runB.color }}>
+                    {runB.label}
+                    {runB.simulated && <span className="ml-1 text-[#6B6B70] font-normal">(sim)</span>}
+                  </th>
                   <th className="py-2 text-right text-xs font-semibold text-[#6B6B70] dark:text-[#98989F]">Change</th>
                 </tr>
               </thead>
@@ -342,6 +346,132 @@ export const CompareRunsPage = () => {
           </div>
         </Card>
       )}
+    </div>
+  );
+};
+
+// ─── Main CompareRunsPage ──────────────────────────────────────────────────
+export const CompareRunsPage = () => {
+  const [allRuns, setAllRuns] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('fix'); // 'fix' | 'compare'
+  const [selectedRunId, setSelectedRunId] = useState('');
+
+  // Load runs from API
+  useEffect(() => {
+    getRuns().then(runs => {
+      if (Array.isArray(runs) && runs.length > 0) {
+        setAllRuns(runs);
+        // Default to first non-simulated run for fix preview
+        const realRun = runs.find(r => !r.simulated) || runs[0];
+        setSelectedRunId(realRun?.id || realRun?._id || '');
+      }
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
+  const tabs = [
+    { id: 'fix', label: 'Fix preview', icon: Wrench, badge: 'New' },
+    { id: 'compare', label: 'Run vs run', icon: BarChart3, badge: null },
+  ];
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-64 text-[#6B6B70] dark:text-[#98989F] text-sm">Loading runs…</div>;
+  }
+
+  if (allRuns.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-3 text-center">
+        <p className="text-lg font-semibold text-[#1C1C1E] dark:text-[#F2F2F7]">No Runs Yet</p>
+        <p className="text-sm text-[#6B6B70] dark:text-[#98989F]">
+          Start your first run from the{' '}
+          <a href="/app/new-run" className="text-[#6C63FF] underline">New Run page</a>.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+
+      {/* ── Tab selector ───────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-1 p-1 bg-[#F7F6F3] dark:bg-[#17171B] rounded-2xl border border-[#ECEAE5] dark:border-[#26262F] w-fit">
+        {tabs.map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all relative
+              ${activeTab === tab.id
+                ? 'bg-white dark:bg-[#1E1E24] text-[#1C1C1E] dark:text-[#F2F2F7] shadow-sm'
+                : 'text-[#6B6B70] dark:text-[#98989F] hover:text-[#1C1C1E] dark:hover:text-[#F2F2F7]'}`}
+          >
+            <tab.icon size={15} />
+            {tab.label}
+            {tab.badge && (
+              <span className="text-[9px] bg-[#6C63FF] text-white px-1.5 py-0.5 rounded-full font-bold ml-0.5">
+                {tab.badge}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Run selector for Fix Preview tab ───────────────────────────────── */}
+      {activeTab === 'fix' && allRuns.length > 0 && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="text-xs font-semibold text-[#6B6B70] dark:text-[#98989F] uppercase tracking-widest">Run:</span>
+          <div className="relative">
+            <select
+              value={selectedRunId}
+              onChange={e => setSelectedRunId(e.target.value)}
+              className="appearance-none pl-3 pr-8 py-2 rounded-2xl border border-[#ECEAE5] dark:border-[#26262F]
+                bg-white dark:bg-[#17171B] text-sm text-[#1C1C1E] dark:text-[#F2F2F7]
+                focus:outline-none focus:ring-2 focus:ring-[#6C63FF]/40 transition-all min-w-[280px]"
+            >
+              {allRuns.filter(r => !r.simulated).map(r => (
+                <option key={r.id || r._id} value={r.id || r._id}>
+                  {r.url || r.id} — {r.createdAt ? new Date(r.createdAt).toLocaleDateString() : ''}
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#6B6B70] pointer-events-none" />
+          </div>
+        </div>
+      )}
+
+      {/* ── Tab content ────────────────────────────────────────────────────── */}
+      <AnimatePresence mode="wait">
+        {activeTab === 'fix' ? (
+          <motion.div
+            key="fix"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.25 }}
+          >
+            <FixPreviewTab runId={selectedRunId} />
+          </motion.div>
+        ) : (
+          <motion.div
+            key="compare"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.25 }}
+          >
+            {allRuns.length < 2 ? (
+              <div className="flex flex-col items-center justify-center h-64 gap-3 text-center">
+                <p className="text-lg font-semibold text-[#1C1C1E] dark:text-[#F2F2F7]">Not Enough Runs</p>
+                <p className="text-sm text-[#6B6B70] dark:text-[#98989F]">
+                  You need at least 2 runs to compare. Start a new run or use the Fix preview tab.
+                </p>
+              </div>
+            ) : (
+              <RunVsRunTab allRuns={allRuns} />
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };

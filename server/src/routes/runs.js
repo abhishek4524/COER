@@ -10,6 +10,7 @@ import { enforceQuota } from '../middleware/quota.js';
 
 import { validateTargetUrl } from '../utils/security.js';
 import rateLimit from 'express-rate-limit';
+import fixesRouter from './fixes.js';
 
 const router = Router();
 
@@ -85,8 +86,11 @@ function buildScreensFromSteps(steps = []) {
         url: step.url,
         name: step.pageTitle || label,
         label: step.pageTitle || label,
-        screenshot: step.screenshotUrl,
-        thumbnail: step.screenshotUrl,
+        screenshot: step.fullPageScreenshotUrl || step.screenshotUrl,
+        thumbnail: step.fullPageScreenshotUrl || step.screenshotUrl,
+        docWidth: step.docWidth || 1440,
+        docHeight: step.docHeight || 900,
+        scrollDepth: step.scrollDepth || 0,
         frictionDot: '#8FB8A8',
         frictionScore: 0,
         clickPoints: [],
@@ -98,15 +102,29 @@ function buildScreensFromSteps(steps = []) {
     }
 
     const scr = screensMap.get(urlKey);
-    if (step.screenshotUrl && !scr.screenshot) {
+    if (step.fullPageScreenshotUrl && (!scr.screenshot || !scr.screenshot.includes('full_'))) {
+      scr.screenshot = step.fullPageScreenshotUrl;
+      scr.thumbnail = step.fullPageScreenshotUrl;
+    } else if (step.screenshotUrl && !scr.screenshot) {
       scr.screenshot = step.screenshotUrl;
       scr.thumbnail = step.screenshotUrl;
     }
 
-    if (step.x != null && step.y != null) {
+    if (step.docWidth) scr.docWidth = Math.max(scr.docWidth || 0, step.docWidth);
+    if (step.docHeight) scr.docHeight = Math.max(scr.docHeight || 0, step.docHeight);
+    if (step.scrollDepth) scr.scrollDepth = Math.max(scr.scrollDepth || 0, step.scrollDepth);
+
+    const useX = step.docX ?? step.x;
+    const useY = step.docY ?? step.y;
+
+    if (useX != null && useY != null) {
       const pt = {
-        x: step.x,
-        y: step.y,
+        x: useX,
+        y: useY,
+        cx: useX,
+        cy: useY,
+        docX: useX,
+        docY: useY,
         type: step.action === 'rage_click' ? 'rage' : step.isDeadClick ? 'dead' : 'click',
         weight: step.frustration > 60 ? 2 : 1,
         timestamp: step.ts,
@@ -118,8 +136,8 @@ function buildScreensFromSteps(steps = []) {
       if (step.thought) {
         scr.personaPins.push({
           id: `pin-${step._id}`,
-          x: step.x,
-          y: step.y,
+          x: useX,
+          y: useY,
           name: step.personaName || 'Tester',
           emotion: step.emotion || 'neutral',
           quote: step.thought,
@@ -128,8 +146,8 @@ function buildScreensFromSteps(steps = []) {
       }
     }
 
-    if (scr.rageClusters.length > 1) scr.frictionDot = 'coral';
-    else if (scr.deadClickPoints.length > 1) scr.frictionDot = 'amber';
+    if (scr.rageClusters.length > 1) scr.frictionDot = '#F08A7E';
+    else if (scr.deadClickPoints.length > 1) scr.frictionDot = '#F59E0B';
   }
 
   return Array.from(screensMap.values());
@@ -522,5 +540,13 @@ router.delete('/:id', async (req, res, next) => {
     next(err);
   }
 });
+
+// ─── Fix Emulator Routes ───────────────────────────────────────────────────────
+// Mounts: GET  /api/runs/:id/fixes
+//         POST /api/runs/:id/fixes/preview
+//         POST /api/runs/:id/fixes/retest
+//         GET  /api/runs/:id/fixes/export
+// The fixesRouter uses :id parameter already set by parent router via mergeParams.
+router.use(fixesRouter);
 
 export default router;

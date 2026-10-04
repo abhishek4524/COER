@@ -807,7 +807,7 @@ export async function processAgentRun(runId, io) {
   const run = await Run.findById(runId);
   if (!run) throw new Error(`Run ${runId} not found`);
 
-  await Run.findByIdAndUpdate(runId, { status: 'running' });
+  await Run.findByIdAndUpdate(runId, { status: 'running', startedAt: new Date() });
   io?.to(`run:${runId}`).emit('run:started', { runId, personaCount: run.personaCount });
 
   const personas = await Persona.find().limit(run.personaCount).lean();

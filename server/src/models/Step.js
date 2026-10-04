@@ -53,6 +53,30 @@ const StepSchema = new mongoose.Schema(
       max: 100,
       default: 0,
     },
+    docX: {
+      type: Number,
+      default: null,
+    },
+    docY: {
+      type: Number,
+      default: null,
+    },
+    docWidth: {
+      type: Number,
+      default: 1440,
+    },
+    docHeight: {
+      type: Number,
+      default: 900,
+    },
+    scrollDepth: {
+      type: Number, // 0 - 100 percentage
+      default: 0,
+    },
+    fullPageScreenshotUrl: {
+      type: String,
+      default: null,
+    },
     screenshotUrl: {
       type: String,
       default: null,

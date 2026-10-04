@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router-dom';
-import { Bell, Wifi, WifiOff, User, CreditCard, LogOut, Moon, Sun, Settings } from 'lucide-react';
+import { Bell, Wifi, WifiOff, User, CreditCard, LogOut, Moon, Sun, Settings, Menu } from 'lucide-react';
 import ThemeToggle from '../ui/ThemeToggle';
 import Badge from '../ui/Badge';
 import { useAuth } from '../../context/AuthContext';
+import { useSidebar } from '../../context/SidebarContext';
 
 const routeLabels = {
   '/app/dashboard':   'Results Dashboard',
@@ -201,6 +202,7 @@ export const TopBar = () => {
   const { user, logout } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef(null);
+  const { setMobileOpen } = useSidebar();
 
   const label = Object.entries(routeLabels).find(([k]) => pathname.startsWith(k))?.[1] ?? 'VibeTest';
 
@@ -220,10 +222,19 @@ export const TopBar = () => {
   }, []);
 
   return (
-    <header className="fixed top-0 left-16 right-0 h-14 z-30 flex items-center justify-between px-6 bg-white/80 dark:bg-[#17171B]/80 backdrop-blur-md border-b border-[#ECEAE5] dark:border-[#26262F]">
-      <h1 className="text-sm font-heading font-semibold text-[#1C1C1E] dark:text-[#F2F2F7] tracking-tight">
-        {label}
-      </h1>
+    <header className="fixed top-0 left-0 md:left-16 right-0 h-14 z-30 flex items-center justify-between px-6 bg-white/80 dark:bg-[#17171B]/80 backdrop-blur-md border-b border-[#ECEAE5] dark:border-[#26262F]">
+      <div className="flex items-center">
+        <button
+          className="md:hidden p-2 rounded-lg hover:bg-[#F7F6F3] dark:hover:bg-[#26262F] text-[#6B6B70] dark:text-[#98989F] mr-1"
+          onClick={() => setMobileOpen(true)}
+          aria-label="Open menu"
+        >
+          <Menu size={20} />
+        </button>
+        <h1 className="text-sm font-heading font-semibold text-[#1C1C1E] dark:text-[#F2F2F7] tracking-tight">
+          {label}
+        </h1>
+      </div>
 
       <div className="flex items-center gap-3">
         <HealthIndicator />

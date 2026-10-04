@@ -5,12 +5,24 @@
 :root {
   --bg-color: #F7F6F3;
   --surface-color: #FFFFFF;
+  --surface-raised: #FFFFFF;
+  --surface-sunken: #EFECE6;
   --border-color: #ECEAE5;
+  --border-subtle: #E2DFD7;
   --text-color: #1C1C1E;
+  --text-subtle: #4A4A4F;
   --muted-color: #6B6B70;
   --accent-color: #6C63FF;
   --success-color: #8FB8A8;
   --friction-color: #F08A7E;
+  --overlay: rgba(0, 0, 0, 0.4);
+  --focus-ring: rgba(108, 99, 255, 0.4);
+  --chart-series-1: #6C63FF;
+  --chart-series-2: #8FB8A8;
+  --chart-series-3: #F08A7E;
+  --heatmap-ramp: linear-gradient(to right, #FDE8E4, #F08A7E, #D94E4E);
+  --skeleton: #EAE8E3;
+
   --font-heading: 'Inter Tight', sans-serif;
   --font-body: 'Inter', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
@@ -20,20 +32,38 @@
 .dark {
   --bg-color: #0F0F12;
   --surface-color: #17171B;
+  --surface-raised: #1E1E24;
+  --surface-sunken: #121216;
   --border-color: #26262F;
+  --border-subtle: #1F1F27;
   --text-color: #F2F2F7;
+  --text-subtle: #C7C7CC;
   --muted-color: #98989F;
   --accent-color: #827BFF;
   --success-color: #9EC4B5;
   --friction-color: #F08A7E;
+  --overlay: rgba(0, 0, 0, 0.7);
+  --focus-ring: rgba(130, 123, 255, 0.5);
+  --chart-series-1: #827BFF;
+  --chart-series-2: #9EC4B5;
+  --chart-series-3: #F08A7E;
+  --heatmap-ramp: linear-gradient(to right, #3A1F25, #F08A7E, #FF5252);
+  --skeleton: #22222A;
 }
 
 body {
   background-color: var(--bg-color);
   color: var(--text-color);
   font-family: var(--font-body);
-  transition: background-color 0.3s ease, color 0.3s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   overflow-x: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body, *, *::before, *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0.001s !important;
+  }
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -46,29 +76,29 @@ h1, h2, h3, h4, h5, h6 {
 
 /* Glassmorphism helpers */
 .glass-panel {
-  background: rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.75);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(236, 234, 229, 0.6);
+  border: 1px solid rgba(236, 234, 229, 0.7);
 }
 
 .dark .glass-panel {
-  background: rgba(23, 23, 27, 0.7);
+  background: rgba(23, 23, 27, 0.75);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(38, 38, 47, 0.6);
+  border: 1px solid rgba(38, 38, 47, 0.7);
 }
 
 .glass-card {
-  background: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.85);
   backdrop-filter: blur(12px);
-  border: 1px solid #ECEAE5;
+  border: 1px solid var(--border-color);
 }
 
 .dark .glass-card {
-  background: rgba(23, 23, 27, 0.8);
+  background: rgba(23, 23, 27, 0.85);
   backdrop-filter: blur(12px);
-  border: 1px solid #26262F;
+  border: 1px solid var(--border-color);
 }
 
 /* Marquee animation */

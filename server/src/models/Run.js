@@ -75,6 +75,10 @@ const RunSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    startedAt: {
+      type: Date,
+      default: null,
+    },
     completedAt: {
       type: Date,
       default: null,
@@ -87,6 +91,27 @@ const RunSchema = new mongoose.Schema(
     shareExpiresAt: {
       type: Date,
       default: null,
+    },
+
+    // ─── Fix Emulator: child run fields ──────────────────────────────────────
+    parentRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Run',
+      default: null,
+      index: true,
+    },
+    mode: {
+      type: String,
+      enum: ['normal', 'patched'],
+      default: 'normal',
+    },
+    simulated: {
+      type: Boolean,
+      default: false,
+    },
+    enabledFixIds: {
+      type: [String],
+      default: [],
     },
   },
   {

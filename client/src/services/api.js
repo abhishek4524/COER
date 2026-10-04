@@ -740,3 +740,119 @@ export const revokeApiKey = async (keyId) => {
   }
 };
 
+// ─── Fix Emulator API ─────────────────────────────────────────────────────────
+
+const MOCK_FIXES = [
+  {
+    id: 'mock-fix-1', runId: 'mock', pagePath: '/',
+    title: 'Make primary CTA button visible and high-contrast',
+    problem: 'Primary call-to-action is tiny (9px, cream on white) — 3/3 personas missed it.',
+    evidence: { page: '/', element: '.btn-proceed', personasAffected: 3, metric: 'CTA miss: 3 personas' },
+    severity: 'critical',
+    patchOps: [{ type: 'setStyle', selector: '.btn-proceed', cssProps: { background: '#6C63FF', color: '#FFFFFF', fontSize: '16px', fontWeight: '600', padding: '14px 28px', borderRadius: '8px', display: 'inline-block' } }],
+    codeSnippet: '.btn-proceed {\n  background: #6C63FF;\n  color: #fff;\n  font-size: 16px;\n  font-weight: 600;\n  padding: 14px 28px;\n  border-radius: 8px;\n}',
+    confidence: 0.97, effort: 'low',
+    expectedImpact: 'CTA becomes discoverable — projected +30–60% conversion.',
+    source: 'deterministic', previewAvailable: true,
+  },
+  {
+    id: 'mock-fix-2', runId: 'mock', pagePath: '/',
+    title: 'Replace jargon with plain language',
+    problem: '"Initiate SKU Acquirement Workflow" confuses all non-technical users.',
+    evidence: { page: '/', element: '.btn-proceed', personasAffected: 3, metric: 'Jargon detected' },
+    severity: 'high',
+    patchOps: [{ type: 'setText', selector: '.btn-proceed', text: 'Buy Now' }],
+    codeSnippet: '<a class="btn-proceed">Buy Now</a>',
+    confidence: 0.88, effort: 'low',
+    expectedImpact: 'Users immediately understand the action.',
+    source: 'deterministic', previewAvailable: true,
+  },
+  {
+    id: 'mock-fix-3', runId: 'mock', pagePath: '/signup',
+    title: 'Add visible label to email field',
+    problem: 'Email field has no label — only a vague placeholder.',
+    evidence: { page: '/signup', element: 'input.input-no-label', personasAffected: 2, metric: 'Missing label (WCAG 1.3.1)' },
+    severity: 'high',
+    patchOps: [{ type: 'addLabel', selector: 'input.input-no-label', text: 'Email address' }, { type: 'setAttribute', selector: 'input.input-no-label', name: 'aria-label', value: 'Email address' }],
+    codeSnippet: '<label for="email">Email address</label>\n<input id="email" type="email" />',
+    confidence: 0.9, effort: 'low',
+    expectedImpact: 'Eliminates confusion; screen-reader accessible.',
+    source: 'deterministic', previewAvailable: true,
+  },
+  {
+    id: 'mock-fix-4', runId: 'mock', pagePath: '/checkout',
+    title: 'Style checkout button as primary action',
+    problem: '"Proceed to Fulfilment Matrix" button looks disabled (grey) — users assume it\'s inactive.',
+    evidence: { page: '/checkout', element: '.btn-fulfilment', personasAffected: 3, metric: 'Perceived disabled' },
+    severity: 'critical',
+    patchOps: [{ type: 'setStyle', selector: '.btn-fulfilment', cssProps: { background: '#6C63FF', color: '#fff', fontSize: '16px', fontWeight: '600', padding: '14px 24px', borderRadius: '8px', cursor: 'pointer', width: '100%', border: 'none', opacity: '1' } }],
+    codeSnippet: '.btn-fulfilment {\n  background: #6C63FF;\n  color: #fff;\n  font-size: 16px;\n  font-weight: 600;\n  padding: 14px 24px;\n  border-radius: 8px;\n  cursor: pointer;\n}',
+    confidence: 0.95, effort: 'low',
+    expectedImpact: 'Checkout abandonment drops significantly.',
+    source: 'deterministic', previewAvailable: true,
+  },
+];
+
+export const getRunFixes = async (runId) => {
+  if (USE_MOCK || !runId) {
+    return { fixes: MOCK_FIXES, previewable: true, childRunId: null, generatedAt: new Date().toISOString() };
+  }
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/fixes`, { credentials: 'include' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.success && json.data) return json.data;
+    return null;
+  } catch (err) {
+    console.warn('[api] getRunFixes error:', err.message);
+    return null;
+  }
+};
+
+export const previewFixes = async (runId, { enabledFixIds, pagePath }) => {
+  if (USE_MOCK) {
+    return { beforeUrl: '/assets/steps/product.png', afterUrl: '/assets/steps/product.png', bboxes: [{ fixId: 'mock-fix-1', fixTitle: 'CTA fix', selector: '.btn-proceed', bbox: { x: 220, y: 310, width: 180, height: 36 } }], feasible: true, reason: null };
+  }
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/fixes/preview`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ enabledFixIds, pagePath }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    return json.success ? json.data : null;
+  } catch (err) {
+    console.warn('[api] previewFixes error:', err.message);
+    return null;
+  }
+};
+
+export const retestWithFixes = async (runId, { enabledFixIds }) => {
+  if (USE_MOCK) {
+    return { childRunId: `mock-child-${Date.now()}`, parentRunId: runId, simulated: true, status: 'running' };
+  }
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/fixes/retest`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ enabledFixIds }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    return json.success ? json.data : null;
+  } catch (err) {
+    console.warn('[api] retestWithFixes error:', err.message);
+    return null;
+  }
+};
+
+export const exportFixes = async (runId) => {
+  try {
+    const res = await fetch(`${API_URL}/runs/${runId}/fixes/export`, { credentials: 'include' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  } catch (err) {
+    console.warn('[api] exportFixes error:', err.message);
+    return null;
+  }
+};
